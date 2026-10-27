@@ -1,0 +1,449 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Euro Glam BD — Prisma schema
+// PostgreSQL connector. relationMode stays at the default "foreignKeys" —
+// the "prisma" mode moves enforcement into the client and is WEAKER, not
+// stronger, for orphan prevention. See DECISIONS.md.
+//
+// Conventions enforced here:
+//   • Money is Int in poisha (1 BDT = 100 poisha). Never Float, never Decimal.
+//   • JSON columns that must be filterable use Jsonb (plain Json cannot be
+//     compared in .where() at all).
+//   • onDelete is written EXPLICITLY on every relation. Prisma's default is
+//     SetNull for optional relations and Restrict for mandatory ones —
+//     SetNull on a required FK fails at runtime, not at migrate time.
+//   • String[] scalar lists are PostgreSQL-only and are NOT indexed here;
+//     @@index on a scalar list is unsupported. Use a raw GIN index if needed.
+// ─────────────────────────────────────────────────────────────────────────────
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Enums
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum UserRole {
+  CUSTOMER
+  ADMIN
+}
+
+enum OrderStatus {
+  PENDING
+  PROCESSING
+  SHIPPED
+  DELIVERED
+  CANCELLED
+}
+
+enum PaymentMethod {
+  COD
+  BKASH
+  NAGAD
+  CARD
+}
+
+enum PaymentStatus {
+  PENDING
+  PAID
+  FAILED
+  REFUNDED
+}
+
+enum MessageRole {
+  USER
+  ASSISTANT
+  SYSTEM
+}
+
+enum SkinType {
+  NORMAL
+  DRY
+  OILY
+  COMBINATION
+  SENSITIVE
+  ACNE_PRONE
+  UNKNOWN
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Users & Auth
+// ─────────────────────────────────────────────────────────────────────────────
+
+model User {
+  id           String   @id @default(cuid())
+  name         String   @db.VarChar(160)
+  email        String   @unique @db.VarChar(255)
+  phone        String?  @db.VarChar(20)
+  passwordHash String   @db.VarChar(255)
+  role         UserRole @default(CUSTOMER)
+
+  /// Explicit SMS consent (locked decision #9). Default false.
+  smsOptIn Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  cart              Cart?
+  orders            Order[]
+  reviews           Review[]
+  skinProfile       UserSkinProfile?
+  advisorConversations AdvisorConversation[]
+
+  @@index([role])
+  @@map("users")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Catalogue
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Category {
+  id       String  @id @default(cuid())
+  name     String  @db.VarChar(120)
+  slug     String  @unique @db.VarChar(140)
+
+  products Product[]
+
+  @@map("categories")
+}
+
+model Product {
+  id          String   @id @default(cuid())
+  name        String   @db.VarChar(220)
+  description String   @db.Text
+
+  categoryId  String
+  category    Category @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+
+  /// Price in poisha (1 BDT = 100 poisha).
+  pricePaisa        Int
+  /// Discounted price in poisha. Null when the product is not discounted.
+  discountPricePaisa Int?
+  /// Convenience mirror of the discount for badge rendering. Null = no discount.
+  discountPercentage Int?
+
+  stockQuantity Int @default(0)
+
+  /// Free-text ingredients, for the PDP ingredients section (PRD §3.F).
+  /// Shape: { "ingredients": ["..."], "notes": "..." }
+  /// Json + @db.JsonB: the PostgreSQL `jsonb` column type. Must be Jsonb
+  /// (not plain `json`) so it remains filterable in .where() — a plain
+  /// `json` column cannot be compared at all.
+  ingredients Json @db.JsonB @default("{}")
+
+  /// Canonical ingredient IDs (AHA, BHA, RETINOL, VITAMIN_C, ...) used by the
+  /// deterministic conflict engine. Populated by admin from the static
+  /// catalogue — never fuzzy-matched at runtime.
+  /// NOTE: deliberately NOT indexed. @@index on a scalar list is unsupported.
+  ingredientTags String[] @default([])
+
+  /// Climate adaptation tips for Bangladesh's hot, humid weather (PRD §3.D).
+  climateTips String? @db.Text
+
+  /// Storage adapter keys — NOT raw URLs, so the driver can be swapped.
+  images String[] @default([])
+
+  isNewArrival  Boolean @default(false)
+  isBestSeller  Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  reviews   Review[]
+  orderItems OrderItem[]
+  cartItems CartItem[]
+
+  @@index([categoryId])
+  @@index([isNewArrival])
+  @@index([isBestSeller])
+  @@index([createdAt])
+  @@map("products")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Cart
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Cart {
+  id        String   @id @default(cuid())
+  userId    String   @unique
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  items CartItem[]
+
+  @@map("carts")
+}
+
+model CartItem {
+  id        String   @id @default(cuid())
+  cartId    String
+  cart      Cart     @relation(fields: [cartId], references: [id], onDelete: Cascade)
+  productId String
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Restrict)
+  quantity  Int      @default(1)
+  createdAt DateTime @default(now())
+
+  @@unique([cartId, productId])
+  @@index([productId])
+  @@map("cart_items")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Orders — history must survive. All FKs are Restrict.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Order {
+  id        String      @id @default(cuid())
+  userId    String
+  user      User        @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  /// Totals in poisha.
+  totalAmountPaisa    Int
+  shippingAmountPaisa Int @default(0)
+  discountAmountPaisa Int @default(0)
+
+  shippingAddress Json
+  status          OrderStatus    @default(PENDING)
+  paymentMethod   PaymentMethod  @default(COD)
+  paymentStatus   PaymentStatus  @default(PENDING)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  items OrderItem[]
+
+  @@index([userId, createdAt])
+  @@index([status])
+  @@map("orders")
+}
+
+model OrderItem {
+  id      String @id @default(cuid())
+  orderId String
+  order   Order  @relation(fields: [orderId], references: [id], onDelete: Restrict)
+
+  /// The product row is Restrict: deleting a product must not rewrite history.
+  productId String
+  product   Product @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  /// Name and price are snapshotted so historical orders stay accurate even
+  /// if the catalogue later renames the product or changes its price.
+  productName    String @db.VarChar(220)
+  pricePaisa     Int
+  quantity       Int
+  /// User-supplied estimate of when the product runs out. Never inferred.
+  estimatedEmptyAt DateTime?
+  /// Set when the expiry reminder SMS has been sent for this line.
+  reminderSentAt DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@index([orderId])
+  @@index([productId])
+  @@index([estimatedEmptyAt])
+  @@map("order_items")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Reviews — unverified purchases allowed, but gated on approval (decision #10)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Review {
+  id        String  @id @default(cuid())
+  productId String
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  rating  Int
+  comment String  @db.Text
+
+  /// Storage adapter key for an unboxing / review clip. Null for text-only.
+  videoUrl String? @db.VarChar(300)
+
+  isApproved Boolean  @default(false)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([productId, isApproved])
+  @@index([userId])
+  @@map("reviews")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AI Advisor — conversations & messages
+// ─────────────────────────────────────────────────────────────────────────────
+
+model AdvisorConversation {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  title         String?  @db.VarChar(160)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  lastMessageAt DateTime @default(now())
+
+  messages AdvisorMessage[]
+  images   AdvisorImage[]
+
+  @@index([userId, lastMessageAt(sort: Desc)])
+  @@map("advisor_conversations")
+}
+
+model AdvisorMessage {
+  id             String              @id @default(cuid())
+  conversationId String
+  conversation   AdvisorConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  role    MessageRole
+  content String          @db.Text
+
+  /// Which provider/model produced this message, for auditability.
+  provider String? @db.VarChar(40)
+  model    String? @db.VarChar(80)
+  /// True when the deterministic mock produced it (never a paid real call).
+  isMocked Boolean @default(false)
+
+  /// Structured payload: recommended product ids, detected conflicts,
+  /// the disclaimer version shown, and a skin-profile snapshot.
+  /// @db.JsonB so admin queries can filter on it.
+  meta Json? @db.JsonB
+
+  createdAt DateTime @default(now())
+
+  @@index([conversationId, createdAt])
+  @@index([isMocked])
+  @@map("advisor_messages")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Uploaded images
+// ─────────────────────────────────────────────────────────────────────────────
+
+model AdvisorImage {
+  id             String              @id @default(cuid())
+  conversationId String
+  conversation   AdvisorConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  /// Storage adapter key, NOT a raw URL.
+  storageKey String @db.VarChar(200)
+  /// MIME type detected server-side from magic bytes, not client-declared.
+  mimeType   String @db.VarChar(100)
+  byteSize   Int
+  width      Int?
+  height     Int?
+
+  /// Set when the user explicitly saves this image to their skin profile.
+  isProfilePhoto Boolean @default(false)
+  /// Set when the admin deletes it; the file is purged from the adapter.
+  isDeleted      Boolean @default(false)
+
+  createdAt DateTime @default(now())
+
+  /// The skin profile, if the user saved this image as their profile photo.
+  /// Opposite side of UserSkinProfile.profileImage.
+  profileFor UserSkinProfile?
+
+  @@index([conversationId])
+  @@index([isDeleted])
+  @@map("advisor_images")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Skin profile
+// ─────────────────────────────────────────────────────────────────────────────
+
+model UserSkinProfile {
+  id     String @id @default(cuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  skinType SkinType?
+  concerns String[] @default([])
+
+  /// A photo the user explicitly consented to keep.
+  /// @unique: makes this a true one-to-one — one profile photo per profile.
+  /// Without it, two profiles could point at the same image.
+  profileImageId String? @unique
+  /// SetNull: deleting the photo must NOT delete the profile.
+  profileImage AdvisorImage? @relation(fields: [profileImageId], references: [id], onDelete: SetNull)
+
+  notes String? @db.Text
+
+  /// User-provided estimate of when the product runs out. Never inferred.
+  estimatedEmptyAt DateTime?
+
+  /// Explicit SMS consent for the expiry reminder (locked decision #9).
+  smsOptIn Boolean @default(false)
+
+  lastAnalysisDate DateTime?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@map("user_skin_profiles")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AI configuration — admin controlled
+// ─────────────────────────────────────────────────────────────────────────────
+
+model AiConfig {
+  id  String @id @default(cuid())
+  /// Single-row table guarded in the service layer. Always "default".
+  key String @unique @db.VarChar(40)
+
+  /// Exact text shown to users. Admin-editable, but the admin route refuses
+  /// to empty it and the service layer has a hardcoded fallback.
+  disclaimerText    String @db.Text
+  /// Bumped whenever disclaimerText changes; stamped onto every message's
+  /// meta so an audit can prove which version a user actually saw.
+  disclaimerVersion Int    @default(1)
+
+  /// Admin-managed allow-list of products the AI may recommend.
+  /// Empty = all products are allowed.
+  aiProductIds String[] @default([])
+
+  /// Admin-managed prompt override for the AI provider.
+  systemPrompt String? @db.Text
+
+  /// When true the AI must not recommend a product that conflicts with
+  /// anything already in the user's cart.
+  enforceCartConflicts Boolean @default(true)
+
+  updatedAt DateTime @updatedAt
+
+  @@map("ai_configs")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SMS log (mock gateway target)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model SmsLog {
+  id     String @id @default(cuid())
+  phone  String @db.VarChar(20)
+  body   String @db.Text
+  /// The intended recipient, for admin filtering.
+  userId String? @db.VarChar(40)
+
+  /// "sent" | "failed" | "queued" — the mock gateway always "sends".
+  status      String   @default("sent")
+  provider    String   @default("mock")
+  /// Idempotency key, so a re-run cannot double-send.
+  idempotencyKey String? @unique @db.VarChar(120)
+
+  createdAt DateTime @default(now())
+
+  @@index([phone])
+  @@index([userId])
+  @@map("sms_logs")
+}
