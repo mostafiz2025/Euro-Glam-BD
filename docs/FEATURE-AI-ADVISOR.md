@@ -259,10 +259,12 @@ User                    Client                 API (route handler)          Serv
  ├───────────────────────>│                            │                          │                       │
  │                        │ POST /api/advisor/chat    │                          │                       │
  │                        │ (multipart: message,      │                          │                       │
- │                        │  image, conversationId?)   │                          │                       │
+ │                        │  image, conversationId,   │                          │                       │
+ │                        │  history?)                │                          │                       │
  │                        ├───────────────────────────>│                          │                       │
  │                        │                    auth → requireUser()            │                       │
  │                        │                    zod parse → UploadService       │                       │
+ │                        │                    parseClientHistory()            │                       │
  │                        │                            ├────────────────────────>│                       │
  │                        │                            │  validateMagicBytes()   │                       │
  │                        │                            │  storage.put()          │                       │
@@ -277,10 +279,15 @@ User                    Client                 API (route handler)          Serv
  │                        │                            │  ├─ load profile ───────┼──────────────────────>│
  │                        │                            │  ├─ load cart products ┼──────────────────────>│
  │                        │                            │  ├─ load candidates ────┼──────────────────────>│
+ │                        │                            │  ├─ load stored history ┼──────────────────────>│
+ │                        │                            │  ├─ mergeHistory(stored, client)                   │
+ │                        │                            │  ├─ detectAdvisorIntent()  (PURE)                  │
  │                        │                            │  ├─ conflictEngine.evaluate()  (PURE)              │
  │                        │                            │  │    ├─ BLOCK → drop candidate, record conflict       │
  │                        │                            │  │    └─ WARN  → keep candidate, attach note          │
- │                        │                            │  └─ aiProvider.complete()  (mock|openai)            │
+ │                        │                            │  └─ aiProvider.complete()  (mock|openai|gemini|     │
+ │                        │                            │                              openrouter)           │
+ │                        │                            │     (prose out, ids via marker + function call)     │
  │                        │                            │<────────────────────────┤                       │
  │                        │                            │ transaction:            │                       │
  │                        │                            │  create ASSISTANT msg ─┼──────────────────────>│
@@ -364,7 +371,10 @@ Multipart. The primary endpoint.
 | `message` | string | 1–2000 chars, trimmed. Optional **only if** `image` is present. |
 | `image` | file | Optional. ≤5MB. Allowed MIME: `image/jpeg`, `image/png`, `image/webp`. |
 | `conversationId` | string | Optional cuid. If omitted, a conversation is created. |
+| `history` | JSON string | Optional. The client's transcript, as an array of `{ role, content }`. Merged with the stored transcript — see §5.8. A malformed history is **logged and dropped**, not rejected. |
 | `saveAsProfilePhoto` | boolean | Optional, default `false`. |
+
+**The `history` field** is a convenience, not a requirement. The server reads the transcript from the database on its own; the client sends its copy so the advisor has the whole conversation even on a turn the database has not caught up with. It is bounded by `advisorHistorySchema` — twenty turns, a strict shape — and the merge is conservative: the stored transcript wins unless the client's demonstrably extends it.
 
 **Response** — `200`
 
@@ -477,6 +487,10 @@ src/
 │   │   ├── provider.ts             # AiProvider interface
 │   │   ├── mock-provider.ts
 │   │   ├── openai-provider.ts
+│   │   ├── gemini-provider.ts      # real Google Gemini provider
+│   │   ├── openrouter-provider.ts  # real OpenRouter provider (a router)
+│   │   ├── openai-compatible.ts    # the shared chat-completions dialect
+│   │   ├── language.ts             # deterministic EN / BN / Banglish detection
 │   │   └── service.ts              # orchestration
 │   ├── conflicts/
 │   │   ├── catalogue.ts            # canonical ingredient IDs + aliases
@@ -537,6 +551,14 @@ export type AdvisorRequest = {
   conflicts: ConflictReport[];
   allowedProductIds: string[] | null;   // null = all
   systemPrompt: string | null;
+  history?: AdvisorHistoryTurn[];        // prior turns, oldest first
+  language?: AdvisorLanguage;            // decided in code
+  intent?: AdvisorIntent;                // decided in code
+};
+
+export type AdvisorHistoryTurn = {
+  role: "USER" | "ASSISTANT";
+  content: string;
 };
 
 export type AdvisorResponse = {
@@ -550,30 +572,107 @@ export type AdvisorResponse = {
 export interface AiProvider {
   readonly name: string;
   readonly modelName: string;
+  readonly supportsVision?: boolean;
   complete(request: AdvisorRequest): Promise<AdvisorResponse>;
 }
 ```
 
 **Critical:** `complete()` receives candidates and conflicts **already filtered and decided by code**. The provider's only job is to phrase an answer. It cannot add a product that code excluded, because the response validator (§5.5) rejects any recommended id not in the candidate list.
 
+**The response is prose.** The provider does not ask the model for JSON. The reply is plain text, and the product ids travel on a side channel — a `[RECOMMENDED: …]` marker line and, for Gemini, a function call. See §5.7.
+
 ### 5.2 Providers
 
-**Mock** (`src/lib/ai/mock-provider.ts`) — deterministic. Given the same input it must produce the same output. Implementation: derive a seed from a hash of `userMessage + sorted candidate ids + sorted conflict rule ids`; use that seed to pick from canned response templates. It must **not** use `Math.random()` or `Date.now()`.
+**Mock** (`src/lib/ai/mock-provider.ts`) — deterministic. Given the same input it must produce the same output. Implementation: derive a seed from a hash of `userMessage + sorted candidate ids + sorted conflict rule ids + the turn's intent`; use that seed to pick from canned response templates. It must **not** use `Math.random()` or `Date.now()`.
 
 Why deterministic: the demo must be reproducible, and CI tests must assert exact output. It also proves the app works with no API key — important for a project that will be run by other people.
 
-**OpenAI** (`src/lib/ai/openai-provider.ts`) — real implementation, active only when `AI_PROVIDER=openai`. Sends the image as a base64 data URL in a vision message. Must never be imported at module scope when the flag is off, so the SDK is not loaded in mock mode.
+The mock honours the **same turn contract** as the real providers: a greeting turn greets and asks, a concern turn answers and recommends, an order turn answers the order question. If the mock dumped a routine on "hi" while Gemini greeted the customer back, the demo would contradict the product.
+
+The mock does **not** emit a marker line — its content goes straight to the customer, so a marker there would be visible in the UI. It returns its ids through `recommendedProductIds`, as it always did.
+
+**OpenAI** (`src/lib/ai/openai-provider.ts`) — real implementation, active only when `AI_PROVIDER=openai`. Sends the image as a base64 data URL in a vision message, and the prior turns as real `user`/`assistant` messages. The request carries **no `response_format`** — the model speaks freely. Must never be imported at module scope when the flag is off, so the SDK is not loaded in mock mode.
+
+**Gemini** (`src/lib/ai/gemini-provider.ts`) — real implementation, active only when `AI_PROVIDER=gemini`. Built on the `@google/genai` SDK. Sends the image as an `inlineData` part and the history as a real multi-turn `contents` transcript. The config carries **no `responseMimeType` and no `responseJsonSchema`** — the model speaks freely — and instead offers a `recommend_products` function declaration in `AUTO` function-calling mode, so the ids come back as structured arguments. Must never be imported at module scope when the flag is off, so the SDK is not loaded in mock mode — which is why `src/lib/ai/index.ts` re-exports it as a **type-only** export and reaches the class through a dynamic `import()`.
+
+**OpenRouter** (`src/lib/ai/openrouter-provider.ts`) — real implementation, active only when `AI_PROVIDER=openrouter`. OpenRouter is a **router**: one OpenAI-compatible endpoint in front of many upstream model providers. The shop sends one request and OpenRouter decides which upstream provider serves it.
+
+Why it is here: the shop was hitting rate limits on a single provider's shared key, and every one of those `429`s reached the customer as a failed advisor turn. With OpenRouter's `allow_fallbacks: true`, "the upstream provider is full" becomes "some other provider answered" — the difference between a rate limit the customer sees and a rate limit they never notice.
+
+The provider posts to `https://openrouter.ai/api/v1/chat/completions` with the OpenAI-compatible headers — `Authorization: Bearer <OPENROUTER_API_KEY>`, `HTTP-Referer` and `X-Title`. The last two are how OpenRouter attributes the app; they are optional, and they are omitted entirely when unknown rather than sent empty. The model is `OPENROUTER_MODEL`.
+
+**`OPENROUTER_MODEL` must be a multimodal model.** This is not a preference — it is a requirement, and a live probe confirmed it. OpenRouter filters the upstream endpoints by image support automatically, and a **text-only** model turns a photo request into a hard `404`:
+
+> No endpoints found that support image input
+
+So a text-only model id does not degrade the photo analysis — it breaks it, on every attempt. The default, `deepseek/deepseek-v4.1-flash-1017`, is multimodal. The provider turns that `404` into a message naming the setting, because a text-only model and a model that does not exist are **both** `404` and need different fixes.
+
+The request carries `provider: { allow_fallbacks: true }` and nothing else. `require_parameters` is deliberately **left at its default** (`false`) and `sort` is deliberately left unset: the first shrinks the pool of upstream providers to fall back to, and the second overrides the router's own judgement about which provider has capacity — and that judgement is exactly what routes around a rate limit. Image support is a **modality**, not a parameter — OpenRouter routes on it by itself, which is exactly why the flag would not have bought any image safety either.
+
+**The request states its own `max_tokens`, and it has to.** A chat-completions request may leave the reply length to the model, but on OpenRouter that has a cost: the provider reserves credit against the model's **maximum context window** before it runs the request, not against the tokens the reply will actually use. A live call with no ceiling was refused outright:
+
+> This request requires more credits, or fewer max_tokens. You requested up to 131072 tokens, but can only afford 34923.
+
+The advisor's reply is a few hundred tokens; the reservation was for the whole context. The ceiling is set from measured usage — a Bengali turn costs roughly 1700 prompt tokens and up to 680 completion tokens — and a `402` gets its own message, because it is the account's balance rather than a rate limit, and retrying will not change it.
+
+The provider retries `429`, `408`, `500`, `502` and `503` — three attempts, exponential backoff — and does **not** retry a `401` or a `404`, which will never succeed. Must never be imported at module scope when the flag is off, so it is re-exported from `src/lib/ai/index.ts` as a **type-only** export and reached through a dynamic `import()`.
+
+**The product ids travel on three channels.** The advisor has to get the product ids back from the model, and the original answer — the `[RECOMMENDED: …]` marker line — turned out to be dropped often enough to matter. A live conversation check caught the model recommending both products in prose and never writing the line, so `recommendedProductIds` came back empty and the shop attached **no product cards at all**.
+
+Measured against the live API, on the conversation turn:
+
+| channel | recovered |
+|---------|-----------|
+| the marker line | 6 / 8 runs |
+| the tool call   | 0 / 8 runs |
+| **the names**   | 8 / 8 runs |
+
+So the request now also offers a `recommend_products` function, and the three channels are read in order of how much the model had to cooperate:
+
+1. **The tool call** — the model was given a function and asked to call it; the ids are its structured arguments.
+2. **The marker line** — the convention the model has always been given.
+3. **The names in the prose** — the model *mentioned* the products it put in front of the customer, and their names are in the candidate list.
+
+The first two are **statements**; the third is only an **observation**, and a model can mention a product without recommending it ("skip the retinol for now"). So the third channel fires **only** when the other two have both come back empty, only when the marker was absent altogether — `[RECOMMENDED: none]` is the model explicitly saying "I recommended nothing" — and only for products that are not in a conflict, because naming a conflicted product is how the model *warns* about it.
+
+Adding the tool costs the routing nothing: `scripts/probe-endpoints.ts` measured 48/48 upstream endpoints for the configured model supporting tools, so the fallback pool is unchanged.
+
+**A tool call with no prose is retried.** A model given a tool sometimes answers with the call and no text at all — the worst outcome the advisor can produce, and it arrives as a healthy `200`, so no status-code check can see it. The system prompt says in as many words that the prose is the answer and the call is only the bookkeeping, and when it still happens the turn is retried on the same bounded budget. The retry is keyed on the **presence of the call**, not on the ids it carried — a greeting produces a call with an empty id list, and keying on the ids meant that turn failed instead of being retried.
+
+**The shared dialect** (`src/lib/ai/openai-compatible.ts`) — OpenRouter speaks the OpenAI chat-completions dialect, so the message building, the prompt assembly, the image format and the reply parsing live **once**, here, and both providers differ only in how they address the endpoint. A second copy of the prompt assembly would have been a second copy of the advisor's *behaviour*, and the two would have drifted: the day the language rule or the marker convention changed in one, the other would still be sending the old prompt, and the difference would show up as a model that suddenly stopped recommending products.
+
+**Why every provider sits behind the same interface.** Switching `AI_PROVIDER` swaps the *phrasing* of the advice and nothing else. The candidate list, the conflict engine, the allow-list validation and the disclaimer are decided in code and behave identically whichever provider is live. That is what makes "code decides, the model phrases" a property of the *system* rather than of one provider.
 
 **Selection** (`src/lib/ai/index.ts`):
 
 ```ts
-export function getAiProvider(): AiProvider {
-  if (process.env.AI_PROVIDER === "openai") {
+export async function getAiProvider(): Promise<AiProvider> {
+  const name = getAiProviderName();
+
+  if (name === "openai") {
     if (!process.env.OPENAI_API_KEY) {
       throw new Error("AI_PROVIDER=openai requires OPENAI_API_KEY");
     }
+    const { OpenAiProvider } = await import("./openai-provider");
     return new OpenAiProvider();
   }
+
+  if (name === "gemini") {
+    if (!process.env.GEMINI_API_KEY) {
+      throw new Error("AI_PROVIDER=gemini requires GEMINI_API_KEY");
+    }
+    const { GeminiProvider } = await import("./gemini-provider");
+    return new GeminiProvider();
+  }
+
+  if (name === "openrouter") {
+    if (!process.env.OPENROUTER_API_KEY) {
+      throw new Error("AI_PROVIDER=openrouter requires OPENROUTER_API_KEY");
+    }
+    const { OpenRouterProvider } = await import("./openrouter-provider");
+    return new OpenRouterProvider();
+  }
+
   return new MockProvider();
 }
 ```
@@ -663,7 +762,202 @@ if (invalid.length > 0) {
 
 The same applies to conflicts: the provider may rephrase but may not remove a `BLOCK` conflict or downgrade a severity. The service re-attaches the code-decided conflicts to the response after the provider returns, overriding any provider-supplied version. **Code wins, always.**
 
-### 5.6 Storage adapter
+### 5.6 Turn intent — a greeting carries no products
+
+*Added after the live advisor was found to dump a three-product routine on a customer who had typed "Hi". The cause was a single unconditional line at the end of the system prompt: "Answer briefly: two or three short paragraphs, then a short list of recommended products". That instruction applied to every turn, so it applied to a greeting as much as it applied to a real question.*
+
+Whether a turn should carry products is a **decision**, and by the "code decides, the model phrases" rule it cannot be delegated to a prompt. A prompt rule is a request; a code rule is a guarantee.
+
+So the decision is made in `src/lib/ai/intent.ts`, deterministically, and handed to the provider as a fact — the same way the language is.
+
+```ts
+// src/lib/ai/intent.ts
+export type AdvisorIntentKind = "GREETING" | "CONCERN" | "QUESTION" | "ORDER";
+
+export type AdvisorIntent = {
+  readonly kind: AdvisorIntentKind;
+  /** Whether this turn may carry product recommendations at all. */
+  readonly mayRecommend: boolean;
+  /**
+   * Whether this turn may carry ingredient-conflict warnings.
+   *
+   * Deliberately separate from `mayRecommend`: a conflict warning is
+   * about a routine, and a question turn may earn a product without
+   * earning a warning.
+   */
+  readonly mayWarn: boolean;
+  /** What the advisor still needs to know: the skin type, the concerns. */
+  readonly missing: readonly ("SKIN_TYPE" | "CONCERNS")[];
+};
+```
+
+| Intent | What the customer did | May recommend | May warn |
+|---|---|---|---|
+| `GREETING` | Said hello. Nothing else. | **No** | **No** |
+| `CONCERN` | Described their skin, a problem, or a goal. | Yes | **Yes** |
+| `QUESTION` | Asked something specific. | Yes | Only if about combining |
+| `ORDER` | Asked about delivery, payment, a coupon. | **No** | **No** |
+
+`CONCERN` and `QUESTION` both may recommend, but they recommend for different reasons: a concern turn earns a routine, a question turn earns an *answer first*. Collapsing them is how "what about the retinol?" gets answered with a fresh three-product routine.
+
+**The turn instruction** is appended to the system prompt by the provider, alongside the language rule — because it is a fact about *this* request, and the stored prompt cannot know it. It is restated in the brief, next to the customer's question. An admin's prompt override therefore cannot switch the conversational behaviour off.
+
+#### The conflict-warning gate
+
+*Added after a customer who typed "Hi" was shown an amber "Use with care" panel about a retinoid they had never mentioned.*
+
+The conflict list is built from the customer's **cart** plus the candidate set, so it is identical on every turn. A warning that appears on every turn stops being advice and becomes noise. So "may this turn carry a conflict warning?" is answered in code, on `mayWarn`, and enforced in two places at once:
+
+- **The request.** A non-warning turn carries `conflicts: []`, and the brief's conflict section is headed *"not relevant to this turn"* rather than listing the rules. Suppressing the *card* alone is not enough — the prompt tells the model to warn about the conflicts it is given, so an ungated prompt produces the same warning in **prose**.
+- **The response.** The returned `conflicts` array is empty on a non-warning turn, whatever the provider said.
+
+`mayWarn` is true on a concern turn, and on a question turn **only** when the question is about combining products — *"can I use this with my sunscreen?"* is a question whose answer is a conflict; *"how do I use retinol?"* is not. The detector names the *act* of combining ("layer", "combine", "together"), or a linking preposition **accompanied by a product word** — because "I am with my family" is not a question about a routine.
+
+The gate is recorded on the message's `meta` as `mayWarn`, so an audit can see which turns were allowed to warn.
+
+**The enforcement** lives in `selectRecommendedIds` in `src/lib/ai/service.ts`:
+
+```ts
+export function selectRecommendedIds(
+  intent: AdvisorIntent,
+  allowedIds: ReadonlySet<string>,
+  returnedIds: readonly string[],
+  candidates: readonly ProductCandidate[],
+): string[] {
+  if (!intent.mayRecommend) {
+    return [];   // dropped, NOT replaced with the deterministic set
+  }
+  // ...allow-list check, then the deterministic fallback, then the cap
+}
+```
+
+**The order of those two rules is the whole decision.** The deterministic fallback that replaces an out-of-allow-list id would otherwise *invent* a routine on a greeting — the guard rail would have become the bug. On a turn that may not carry products, the provider's ids are dropped, not replaced.
+
+**A photo is a concern, even when the message is "Hi".** A customer who attaches a picture of their face and says "hi" wants the picture looked at. The service layer decides this, because the service layer is where the image is known.
+
+**The mock provider is conversational too.** The mock is what most people actually run; if it dumped a routine on "hi" while Gemini greeted the customer back, the demo would contradict the product. It honours the same turn contract, and the intent kind is part of its seed material so it stays deterministic.
+
+### 5.7 The free-text protocol — how ids travel without a schema
+
+*Added after the JSON schema was removed. The schema was there to make the ids recoverable; it also made every reply the same shape, which is what made the advisor read like a form letter.*
+
+**No provider constrains the response format any more.** The Gemini config carries no `responseMimeType` and no `responseJsonSchema`; the OpenAI request carries no `response_format`. The model writes prose.
+
+The ids travel on their own channel:
+
+```ts
+// src/lib/ai/free-text.ts
+export const RECOMMENDATION_MARKER = "[RECOMMENDED:";
+
+export type ParsedFreeText = {
+  readonly content: string;          // the prose, marker removed
+  readonly productIds: readonly string[];
+  readonly hadMarker: boolean;       // telemetry: prompt-drift signal
+};
+
+export function parseFreeTextReply(
+  text: string,
+  candidates: readonly MarkerCandidate[] = [],
+): ParsedFreeText;
+
+export function parseFunctionCallIds(
+  args: unknown,
+  candidates: readonly MarkerCandidate[] = [],
+): string[];
+```
+
+**The marker line.** The model appends one line to its reply:
+
+```text
+[RECOMMENDED: prod_niacinamide, prod_cleanser]
+```
+
+and, when it recommended nothing, exactly `[RECOMMENDED: none]`. The line is parsed out and removed before the customer sees it.
+
+**The function call.** Gemini additionally emits a `recommend_products` function call carrying the ids as structured arguments. The two channels are merged, the function call first.
+
+**Two channels, because one is not enough.** A live probe showed that Gemini in `AUTO` function-calling mode sometimes returns the function call *without* prose — `response.text` comes back `undefined` and the SDK warns that the response has non-text parts. The marker was followed reliably. So the two cover each other: the function call is primary, the marker is the fallback.
+
+**The parser is defensive on purpose.** A model that ignores the convention is a normal outcome, not an exception — models drift, and a prompt change can cost the convention. So it:
+
+1. recovers the ids when the marker is there;
+2. **removes the marker from the prose, always** — wherever it appears, not just at the end; and
+3. survives its absence — no marker means no ids, not an error.
+
+**An entry that is not a candidate is dropped.** An id is matched exactly first, then by product name (case-insensitively, and only when unambiguous — two products with the same title would make the recommendation a coin flip). Whatever survives is still validated against the allow-list by the service layer.
+
+**The marker is removed twice.** The provider strips it, and so does the service layer (`stripRecommendationMarker`). The second removal is not redundancy for its own sake: the service layer is the last thing between the model's output and the customer, and the invariant it protects is absolute — **a customer must never see `[RECOMMENDED: …]`**.
+
+### 5.8 The multi-turn conversation
+
+The advisor has to remember. "What about the retinol?" means the retinol from two turns ago, not from twenty.
+
+**The provider receives the prior turns as real conversation turns**, not as a summary inside the prompt:
+
+```text
+system     — the persona, the hard rules, the language rule, the turn instruction
+user       — the customer's first message
+assistant  — the advisor's first answer
+user       — the customer's second message
+assistant  — the advisor's second answer
+user       — the current message, with the brief and the photo
+```
+
+That is what makes the advisor feel like it is **remembering** the customer. A model that sees only the latest message treats every turn as a first meeting.
+
+**The brief carries the facts about this turn** — the candidate list, the conflict list, the skin profile, the photo — while the system prompt carries the rules that apply to every turn. The brief is attached to the **current** user turn, because that is where the question is and because the tool call needs the ids attached to the message that asks for them.
+
+**The client sends its transcript.** The server reads the conversation's turns from the database, and that is the authoritative record. But the client knows the transcript *now* — including the message the customer has just sent, which the database has not been told about yet. So the client sends it as a `history` form field, and the two are merged in `mergeHistory` (`src/lib/ai/service.ts`):
+
+```ts
+export function mergeHistory(
+  stored: readonly AdvisorHistoryTurn[],
+  client: readonly AdvisorHistoryTurn[],
+): AdvisorHistoryTurn[];
+```
+
+| Situation | Result |
+|---|---|
+| The client sent nothing | The stored transcript |
+| The client has the same number of turns, or fewer | The stored transcript — it is at least as complete |
+| The client's transcript **starts with** the stored one | The client's — it is the stored one plus newer turns |
+| The client's transcript diverges | The stored transcript — the client is describing a different conversation |
+
+The client's transcript is untrusted input, so it is bounded by a schema (`advisorHistorySchema` in `src/lib/validation/advisor.ts` — twenty turns, a strict shape, and a length cap on each turn). A malformed history is **logged and dropped**, not rejected: the server can read the transcript by itself, and a client that sends a broken history should still get an answer rather than a 400.
+
+### 5.9 The client's transcript — what may be removed, and when
+
+*Added after a customer watched their own message vanish the moment the advisor answered, and after the "thinking" bubble stayed on screen permanently.*
+
+The `messages` array in `AdvisorChat` is what the customer reads. Two rules govern it, and both are about **which bubble is addressed by which id**.
+
+**The customer's own message is never removed by a successful turn.** It appears the moment they press send and it **stays** when the answer arrives; the answer is appended *after* it. The earlier behaviour filtered the optimistic bubble out and replaced it with the reply — so the customer sent "my skin is oily" and watched their own words disappear from the screen. The server persists the message; the server is not what the customer is looking at.
+
+**The pending bubble is removed by its own id.** It has a distinct id from the customer's message, and both the success and the failure path remove it by that id. Removing only the customer's id left the "thinking" bubble orphaned for the rest of the conversation.
+
+A **failed** turn does remove the customer's message, because that message was never sent — leaving it on screen next to an error would show a message that does not exist.
+
+The mutations live in `src/lib/ai/transcript.ts` as pure functions over a plain array, rather than inside `setMessages` callbacks in the component. Testing them where they were meant mounting a component, which meant a DOM, which meant a test stack the project does not have. As pure functions they are asserted directly — and because there is only one copy of the logic, the behaviour under test is the behaviour that ships.
+
+```ts
+// src/lib/ai/transcript.ts
+export function appendAnswer<T extends TranscriptMessage>(
+  messages: readonly T[],
+  ids: TurnIds,
+  answer: T,
+): readonly T[];   // removes the pending bubble, keeps the customer's, appends the answer
+
+export function removeFailedTurn<T extends TranscriptMessage>(
+  messages: readonly T[],
+  ids: TurnIds,
+): readonly T[];   // removes both bubbles of a turn that never happened
+```
+
+**Switching conversations resets the transcript by remounting.** `useState` reads its initial value on the first render only, so a component that is *reconciled* against new props keeps the old conversation's messages on screen under the new one's title. The fix is a `key` on `<AdvisorChat>` in `page.tsx`, set to the conversation id — a different conversation therefore mounts a different component instance with the new transcript.
+
+A `key` is used rather than an effect that resets the state, for two reasons: an effect that calls `setState` synchronously causes a cascading render (the project's own lint rule rejects it), and the remount is what makes the reset *complete* — the draft, the attachment, the error and the pending flag all reset with the transcript, without any of them having to be listed and kept in step.
+
+### 5.10 Storage adapter
 
 ```ts
 // src/lib/storage/adapter.ts
@@ -700,7 +994,7 @@ export interface StorageAdapter {
 | Path traversal | The resolved path must remain inside the upload root — verify with `path.resolve` + a prefix check |
 | Storage key | `scope/yyyy/mm/<32-hex-random>` — no user-derived segments at all |
 
-### 5.7 Auth guards
+### 5.11 Auth guards
 
 ```ts
 // src/lib/auth/guards.ts
@@ -761,6 +1055,10 @@ AUTH_JWT_TTL_SECONDS="604800"
 
 AI_PROVIDER="mock"
 OPENAI_API_KEY=""
+GEMINI_API_KEY=""
+GEMINI_MODEL="gemini-3.5-flash"
+OPENROUTER_API_KEY=""
+OPENROUTER_MODEL="deepseek/deepseek-v4.1-flash-1017"
 
 STORAGE_DRIVER="local"
 UPLOAD_ROOT="./public/uploads"
@@ -863,13 +1161,16 @@ Files: `src/lib/conflicts/catalogue.ts`, `rules.ts`, `engine.ts`.
 
 ### Step 10 — AI providers + service
 
-Files: `src/lib/ai/provider.ts`, `mock-provider.ts`, `openai-provider.ts`, `service.ts`, `index.ts`.
+Files: `src/lib/ai/provider.ts`, `mock-provider.ts`, `openai-provider.ts`, `gemini-provider.ts`, `openrouter-provider.ts`, `openai-compatible.ts`, `free-text.ts`, `intent.ts`, `language.ts`, `service.ts`, `index.ts`.
 
-- `mock-provider.ts` — deterministic. Hash the request to a seed; select from templates. Must emit recommendations only from `request.candidates` and must reflect the conflicts it was given.
-- `openai-provider.ts` — build a system prompt that (a) injects the disclaimer text, (b) injects the candidate list with ids, (c) instructs the model to return product ids only from the list, (d) states the behavioural rules from §5.4. Send the image as a base64 data URL. Use `response_format: { type: "json_schema", ... }` with a strict schema of `{ content, recommendedProductIds }` — structured output is more reliable than parsing free text.
-- `service.ts` — the orchestrator. Load profile, load cart products, load candidates, run the engine, filter `BLOCK` candidates, call the provider, then re-apply the code-decided conflicts (§5.5) and attach the disclaimer.
+- `mock-provider.ts` — deterministic. Hash the request to a seed; select from templates. Must emit recommendations only from `request.candidates` and must reflect the conflicts it was given. Must honour the turn contract (§5.6): a greeting turn greets and asks, and carries no products. Must **not** emit a marker line — its content goes straight to the customer.
+- `free-text.ts` — the free-text protocol (§5.7). Parses the `[RECOMMENDED: …]` marker out of the prose and reads the ids from it; parses the ids out of a function call's arguments. Removes the marker wherever it appears; survives its absence; drops anything that is not a candidate.
+- `openai-provider.ts` — build a system prompt that (a) injects the disclaimer text, (b) injects the candidate list with ids, (c) instructs the model to report its ids on the marker line, (d) states the behavioural rules from §5.4. Append the language rule and the turn instruction (§5.6). Send the image as a base64 data URL, and the prior turns as real `user`/`assistant` messages (§5.8). The request carries **no `response_format`** — the model speaks freely.
+- `gemini-provider.ts` — the same contract against `@google/genai`. The history is a real multi-turn `contents` transcript (`role: "model"` for assistant turns), the image is an `inlineData` part at `MEDIA_RESOLUTION_HIGH`. The config carries **no `responseMimeType` and no `responseJsonSchema`**; instead a `recommend_products` function declaration is offered in `AUTO` function-calling mode, so the ids come back as structured arguments as well as on the marker line.
+- `intent.ts` — the turn-intent detection (§5.6). Deterministic, no I/O, no clock, no randomness.
+- `service.ts` — the orchestrator. Load profile, load cart products, load candidates, run the engine, filter `BLOCK` candidates, detect the turn intent, merge the stored and client histories (§5.8), call the provider, then re-apply the code-decided conflicts (§5.5), enforce the turn contract via `selectRecommendedIds` (§5.6), strip any stray marker, and attach the disclaimer.
 
-**Verify:** with `AI_PROVIDER=mock`, the service returns a response with no API key set and no network access. Call it twice with the same input and assert the output is byte-identical.
+**Verify:** with `AI_PROVIDER=mock`, the service returns a response with no API key set and no network access. Call it twice with the same input and assert the output is byte-identical. Then assert that a `"Hi"` turn produces **no** recommendations, and that a turn describing an oily, acne-prone skin produces some.
 
 ### Step 11 — API routes
 
@@ -956,9 +1257,18 @@ Minimal but functional: a table of advisor messages with filters (provider, date
 | Prompt injection via a crafted review | The provider's output is validated against an allow-list; product ids outside the candidate set are dropped |
 | LLM ignoring the disclaimer | The disclaimer is attached by the service layer after the provider returns, not requested from the provider |
 | LLM overriding a safety rule | Code-decided conflicts are re-attached after the provider returns; the provider cannot downgrade a severity |
+| The recommendation marker reaching a customer | The marker is stripped by the provider **and** again by the service layer, which is the last thing between the model's output and the customer |
+| A client rewriting the conversation history | The stored transcript wins unless the client's demonstrably extends it; a malformed client history is dropped, not rejected |
+| A client making the prompt arbitrarily large | `advisorHistorySchema` caps the client's transcript at twenty turns, the same cap the stored transcript uses |
+| An unsolicited ingredient-conflict card on a casual turn | The turn's `mayWarn` gates both the request's conflict list and the response's conflicts; a preposition alone never makes a turn a warning turn |
+| A conflict warning leaking into the **prose** instead of the card | The request carries no conflict list on a non-warning turn, and the brief says the conflicts are not relevant to this turn |
+| The customer's own message disappearing when the answer arrives | The optimistic bubble is kept on a successful turn; only a failed turn removes it, because that message was never sent |
+| The "thinking" bubble lingering forever | The pending bubble has its own id and is removed by that id on both the success and the failure path |
+| The previous conversation's transcript showing under a new one | The `key` on `<AdvisorChat>` is the conversation id, so a different conversation mounts a different component instance |
 | Admin modifying the disclaimer | The admin route rejects an empty disclaimer; the service layer has a hardcoded fallback |
 | Unauthorised access to a conversation | Every query is scoped by `userId`; a non-owned id returns `404` |
 | Rate limiting on the AI endpoint | 20 messages/hour/user — essential, since each message is a paid API call in production |
+| An upstream model provider being rate-limited | The OpenRouter provider sends `allow_fallbacks: true`, so the request is routed to a provider with capacity; a `429` that still reaches the shop is retried three times with a backoff |
 
 ---
 
@@ -971,4 +1281,8 @@ These are **not** blocking this feature, but they must be resolved before the pl
 3. **Real OpenAI costs need a budget.** The rate limit (20/hour/user) is a starting point, not a cost control. Add a per-user daily cap before enabling the real provider in a public demo.
 4. **Bangla localisation is not covered.** The rules' `message` and `remedy` strings are English. A Bangla variant is a data change, not a code change — the fields are already structured for it.
 5. **Moderation of advisor messages.** PRD §4 says the admin should "monitor chatbot recommendations". This spec provides the visibility. An explicit approve/reject workflow for advisor messages is not included and may not be needed, since the AI's output is deterministic and rule-governed.
-6. **The `openai-provider` structured-output contract has not been verified against a live API.** Test it with a real key before relying on it.
+6. **The free-text protocol has not been verified against a live API on every provider.** The Gemini and OpenRouter paths were verified live — the marker is followed most of the time, the function call covers the turns where the model returns no prose, and the names in the prose cover the rest. The OpenAI path relies on the same three channels but has not been run against the live API. Run `npm run verify:conversation` with a real key before relying on it.
+7. **The Gemini free tier allows twenty requests a day.** `scripts/verify-conversation.ts` makes three. The integration suite pins `AI_PROVIDER=mock` so it never spends the quota, but any manual run against the live provider will.
+8. **The OpenRouter model id is a deployment setting, not a constant.** `OPENROUTER_MODEL` must name a model OpenRouter actually serves, and it must be **multimodal** — a text-only model is rejected outright on a photo, not quietly degraded. The set of models changes. `scripts/verify-openrouter.ts` is the check — it fails loudly on a model that does not exist, where the live advisor would otherwise fail on the customer's turn.
+9. **The OpenRouter account needs credit.** The live runs during this work exhausted the key's balance, and a request without a `max_tokens` ceiling is refused with a `402` before it reaches the model. The provider now states its own ceiling so the reservation matches the request, but a `402` still means the balance is genuinely too small — check it with `scripts/probe-credits.ts`.
+10. **The name-recovery channel is the weakest of the three.** It fires only when the marker and the tool call have both come back empty, and it can only recognise a product the model named *exactly*. A model that describes a product instead of naming it ("your balancing serum") will not be recovered. It is a safety net, not the primary channel.

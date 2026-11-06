@@ -1,0 +1,58 @@
+-- Payment details on orders — mobile banking transaction references.
+--
+-- Two nullable columns on `orders`:
+--
+--   1. `paymentTransactionId` — the TrxID bKash and Nagad show on their
+--      confirmation screen.
+--
+--   2. `paymentSenderNumber` — the mobile number the transfer was sent
+--      FROM.
+--
+-- ── Why these are columns and not a JSON blob ─────────────────────────────
+--
+-- The order already stores `shippingAddress` as `Json`, and it would have
+-- been easy to follow that pattern here. These are not address-shaped
+-- data, though:
+--
+--   • They are **queried**. The admin's job is "show me the orders whose
+--     TrxID is X" — to reconcile a transfer against an order. A JSON
+--     field cannot be indexed or filtered without a JSONB expression
+--     index, so the reconciliation query would end up a full table scan
+--     over the order history.
+--
+--   • They are **typed and validated**. A column is `VarChar(64)` and
+--     the schema validates the format before the row is written. Inside
+--     a JSON blob, `paymentTransactionId` could be a number, a nested
+--     object, or an array, and the type checker would never complain.
+--
+--   • They are **flat**. Two strings with no nesting are columns. The
+--     moment a third field appears, that is the moment to reconsider.
+--
+-- ── Why they are nullable ────────────────────────────────────────────────
+--
+-- Because two of the four payment methods have no such reference.
+--
+-- `COD` — the cash is collected by the courier; there is no transaction
+-- ID and no sender number.
+--
+-- `CARD` — the payment is settled by the gateway. The reference is the
+-- gateway's own, and it does not exist yet at order-placement time.
+--
+-- So a NULL here is meaningful, not missing data: it says "this order
+-- was not paid by mobile banking".
+--
+-- ── No backfill ──────────────────────────────────────────────────────────
+--
+-- Every existing order is a COD order, and every COD order has neither a
+-- transaction ID nor a sender number. There is nothing to carry across,
+-- so the columns are added empty. A backfill that invented placeholder
+-- values would be worse than NULL: a placeholder reads as "the customer
+-- gave us this", which is false.
+--
+-- The `payment_method` column is **not** touched. It already carries the
+-- four enum values; this migration only adds the two references needed
+-- to settle the two that are transferred in advance.
+
+-- AlterTable
+ALTER TABLE "orders" ADD COLUMN     "paymentTransactionId" VARCHAR(64),
+ADD COLUMN     "paymentSenderNumber" VARCHAR(20);

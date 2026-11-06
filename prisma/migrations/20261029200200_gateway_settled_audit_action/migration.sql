@@ -1,0 +1,39 @@
+-- Step 19 — The gateway settled an order's payment.
+--
+-- One change:
+--
+--   1. `AdminAction` gains `ORDER_PAYMENT_GATEWAY_SETTLED`. A customer
+--      settling their own payment through the sandbox gateway is an
+--      event the trail must be able to record.
+--
+-- ── Why this needs its own value ───────────────────────────────────────────
+--
+-- `ORDER_PAYMENT_STATUS_CHANGED` already exists, and it would have been
+-- the obvious thing to reuse. But it means "a staff member changed this
+-- order's payment status", and the audit trail's whole job is to answer
+-- *who did this*.
+--
+-- With one value for both, a customer's self-service payment would be
+-- indistinguishable from a staff member confirming a transfer by hand —
+-- and the trail would be answering "an admin confirmed this payment" for
+-- an event where no admin was involved.
+--
+-- `AdminAuditLog.actorId` is a plain foreign key to `User` with no role
+-- constraint, so a customer **can** be an audit actor. The trail
+-- therefore reads: actor = the customer, action =
+-- `ORDER_PAYMENT_GATEWAY_SETTLED`, entity = the order, before =
+-- `{paymentStatus: "PENDING"}`, after = `{paymentStatus: "PAID"}`.
+--
+-- ── Why the same value is used for a failed attempt ───────────────────────
+--
+-- A failed attempt also writes this action, with an `after` of
+-- `{paymentStatus: "PENDING", outcome: "FAILED"}`. It is the same *kind*
+-- of event — the customer used the gateway — and the outcome is recorded
+-- in the `after` snapshot rather than in a separate action, so the
+-- vocabulary stays small.
+--
+-- There is no backfill: the enum value is new, and no existing row
+-- refers to it.
+
+-- AlterEnum
+ALTER TYPE "AdminAction" ADD VALUE 'ORDER_PAYMENT_GATEWAY_SETTLED';

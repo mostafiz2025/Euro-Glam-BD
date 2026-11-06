@@ -1,0 +1,111 @@
+-- Step 19 — Skin concerns on a product, and coupons at checkout.
+--
+-- Two features, one migration, because both are additive column
+-- additions to tables that are already live.
+--
+-- ── 1. `products.concernSlugs` ───────────────────────────────────────────
+--
+-- The "Shop by Concern" axis.
+--
+-- A product already carried `ingredientTags` — the canonical ingredient
+-- IDs (AHA, BHA, RETINOL, ...) that the conflict engine reasons about.
+-- But the storefront's concern cards link to `?ingredient=<tag>`, so
+-- "Acne" was a *filter over ingredients* rather than a fact about the
+-- product. An admin could not say "this serum is for acne" — only
+-- "this serum contains BHA" — and the two are not the same claim. A
+-- product containing salicylic acid is not thereby an acne product;
+-- it might equally be marketed for congestion, texture or dullness.
+--
+-- So a product now carries its concerns explicitly, as a list of
+-- `SkinConcern` slugs.
+--
+-- ── Why slugs, and not ids or a join table ─────────────────────────────
+--
+-- A **join table** would be the textbook answer, and it is the wrong
+-- one here. The vocabulary is small and already admin-managed, it is
+-- read on its own rather than joined for extra columns, and every
+-- product read would carry a join. That is the same argument that
+-- made `Product.brand` a plain string (DECISIONS.md #16), and the same
+-- argument that kept `ingredientTags` a scalar list.
+--
+-- An **id** would also work, but a slug is better: a concern can be
+-- renamed — "Oil Control" to "Redness", say — and a rename changes the
+-- name and the description but never the slug. A product's stored
+-- concern would therefore survive a rename, and the customer's link
+-- would keep working. An id would survive too, but it would be
+-- meaningless to anybody reading the database, and the storefront
+-- needs the slug anyway to build its links.
+--
+-- The list is **validated on the way in** against the `SkinConcern`
+-- table, so a product cannot carry a concern the shop does not have.
+--
+-- ── The backfill ────────────────────────────────────────────────────────
+--
+-- There is deliberately **no backfill**. The existing rows already
+-- carry `ingredientTags`, and a concern's `tag` is drawn from the same
+-- canonical ingredient vocabulary — so a mechanical backfill *could*
+-- be written. But it would be a **guess**: a product tagged `BHA` is
+-- not automatically an "Acne" product. The shop decides which concern
+-- a product addresses, and an admin makes that call on the product
+-- form.
+--
+-- So the column starts empty, and the first admin to save a product
+-- fills it in. A product with no concerns is not broken — it simply
+-- does not appear in a concern-filtered listing, which is the honest
+-- state for a product nobody has categorised yet.
+--
+-- A scalar list cannot carry a `@@index` in PostgreSQL, so the column
+-- is deliberately not indexed.
+
+-- AlterTable
+ALTER TABLE "products" ADD COLUMN     "concernSlugs" TEXT[] DEFAULT ARRAY[]::TEXT[];
+
+-- ── 2. The coupon columns ───────────────────────────────────────────────
+--
+-- `carts.couponCode` — the code the customer has applied to their cart.
+--
+-- The cart stores the **code**, not the computed discount, because the
+-- discount depends on the cart's contents — which can change after the
+-- code is applied. Removing the last item from a cart can take a
+-- percentage coupon below the fixed amount it was worth. The amount is
+-- always computed from the lines at the moment it is shown or charged.
+--
+-- `orders.couponCode` and `orders.couponDiscountPaisa` — the record of
+-- what was actually redeemed.
+--
+-- The code is stored rather than the coupon's id for the same reason
+-- the coupon's own `code` column is: it is what the customer was shown
+-- and what they will quote if they ask about the price they paid.
+--
+-- `discountAmountPaisa` already exists and already carries the
+-- free-shipping discount. It is **not** repurposed — it becomes the
+-- *total* discount, that is, the total the customer **saved**:
+--
+--     discountAmountPaisa = freeShippingDiscount + couponDiscount
+--
+-- It is **not** deducted from the total, because the free-shipping
+-- half of it is already reflected in `shippingAmountPaisa`, which is
+-- the charge the customer actually pays for delivery. The invariant
+-- for the amount charged is therefore:
+--
+--     totalAmountPaisa = subtotalPaisa + shippingAmountPaisa - couponDiscountPaisa
+--
+-- Deducting the whole `discountAmountPaisa` would count the free
+-- delivery twice, and would charge the customer for a waiver they were
+-- given.
+--
+-- `couponDiscountPaisa` is the coupon's share of the total saving.
+-- Two columns rather than one per kind of discount, because the
+-- customer is charged one number and every screen that shows it must
+-- show that number.
+--
+-- Existing rows keep `discountAmountPaisa = 0` for the coupon share,
+-- because no existing order used a coupon. Their `discountAmountPaisa`
+-- — the free-shipping discount — is untouched.
+
+-- AlterTable
+ALTER TABLE "carts" ADD COLUMN     "couponCode" VARCHAR(40);
+
+-- AlterTable
+ALTER TABLE "orders" ADD COLUMN     "couponCode" VARCHAR(40),
+ADD COLUMN     "couponDiscountPaisa" INTEGER DEFAULT 0;

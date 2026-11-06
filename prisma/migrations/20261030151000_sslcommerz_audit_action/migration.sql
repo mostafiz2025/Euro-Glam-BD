@@ -1,0 +1,15 @@
+-- The audit action for a gateway-validated settlement.
+--
+-- The existing `ORDER_PAYMENT_GATEWAY_SETTLED` records a customer
+-- settling through the shop's own simulated gateway window. SSLCOMMERZ
+-- is a different actor writing to the same column — a third-party
+-- gateway, acting on a callback the shop verified against the
+-- gateway's own validation API. The trail has to be able to say which
+-- one happened, so it is a new enum value rather than a reused one.
+--
+-- `ALTER TYPE ... ADD VALUE` is idempotent only in the sense that it
+-- fails on a value that already exists. This migration is separate
+-- from the column migration above so that the two concerns — the
+-- order's gateway columns and the audit vocabulary — can be reasoned
+-- about independently.
+ALTER TYPE "AdminAction" ADD VALUE 'ORDER_PAYMENT_SSLCOMMERZ_SETTLED';

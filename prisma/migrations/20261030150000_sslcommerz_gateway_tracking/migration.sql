@@ -1,0 +1,65 @@
+-- SSLCOMMERZ gateway tracking.
+--
+-- Four nullable columns on `orders`, and nothing else.
+--
+-- ── Why the order row, and not a new table ────────────────────────────────
+--
+-- A gateway session belongs to exactly one order, and it is meaningful
+-- only while that order exists. A separate `sslcommerz_sessions` table
+-- would need its own foreign key, its own lifecycle, and its own
+-- cleanup story — for a row that is always 1:1 with an order that
+-- already exists.
+--
+-- The shop's existing gateway columns already establish the pattern:
+-- `paymentGatewaySessionId` holds the shop's own one-shot token, and
+-- `paymentGatewayTransactionId` holds the shop's own transaction
+-- reference. SSLCOMMERZ's handles belong beside them, in the same
+-- spirit and with the same lifecycle: written when the session opens,
+-- consumed or overwritten when it settles.
+--
+-- ── What each column is ──────────────────────────────────────────────────
+--
+--   • `paymentGatewaySessionKey`
+--       The `sessionkey` SSLCOMMERZ returns when it opens a session.
+--       Its validation endpoint takes this key, so it is the handle the
+--       shop uses to ask the gateway whether a transaction is real.
+--
+--   • `paymentGatewayValidationId`
+--       The `val_id` the gateway sends on the success callback, and the
+--       handle its validation API takes. Recording it means a replayed
+--       callback is checked against the same record rather than against
+--       a freshly-opened session.
+--
+--   • `paymentGatewayBankTransactionId`
+--       The `bank_tran_id` — the reference that appears on the
+--       customer's card statement. Distinct from the shop's own
+--       `paymentGatewayTransactionId` and from the customer's
+--       mobile-banking `paymentTransactionId`: three references
+--       answering three different questions.
+--
+--   • `paymentGatewayAmountTaka`
+--       The amount the gateway recorded, in taka. A mismatch against
+--       the order's own total is a refund case, and it is only
+--       detectable if the gateway's number was stored.
+--
+-- ── Why every column is nullable and unindexed ───────────────────────────
+--
+-- A `COD` order, and every order settled through the shop's own
+-- simulated gateway, has no SSLCOMMERZ session at all. So all four are
+-- NULL in the common case, and a NOT NULL column would force a
+-- sentinel value into every row that has no meaning.
+--
+-- There is no index because no hot query filters on these. The gateway
+-- reads and writes them by **order id**, which the primary key already
+-- serves. The lookup that could benefit from an index — finding an
+-- order by its SSLCOMMERZ session key — happens once per callback, on
+-- the redirect path, where a sequential scan over a table this size is
+-- not the bottleneck. Adding an index would be a cost paid on every
+-- write to buy a speed nobody needs yet.
+
+-- AlterTable
+ALTER TABLE "orders"
+    ADD COLUMN "paymentGatewaySessionKey" VARCHAR(64),
+    ADD COLUMN "paymentGatewayValidationId" VARCHAR(64),
+    ADD COLUMN "paymentGatewayBankTransactionId" VARCHAR(64),
+    ADD COLUMN "paymentGatewayAmountTaka" INTEGER;

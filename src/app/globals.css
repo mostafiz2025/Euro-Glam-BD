@@ -1,26 +1,504 @@
 @import "tailwindcss";
 
+/**
+ * Euro Glam BD — design tokens.
+ *
+ * The palette is the brand's signature pink/rose, paired with a warm
+ * neutral ramp. Every colour is defined once here and referenced by name
+ * through Tailwind's `@theme`, so a component never hard-codes a hex
+ * value.
+ *
+ * The rule the whole UI follows: **pink is the accent, never the
+ * background.** A full-bleed pink page reads as cheap; a rose accent on
+ * a warm off-white canvas reads as premium. So the canvas is warm
+ * neutral, the primary action is rose, and rose is used sparingly
+ * enough that it still means "this is the button".
+ *
+ * ── On the dark theme ───────────────────────────────────────────────────
+ *
+ * Dark mode here is a **token layer**, not a `dark:` prefix sprinkled
+ * over every element. A component says `bg-surface` and never learns
+ * which theme it is in; the tokens decide. That is the only approach
+ * that stays coherent when a new component is added — a `dark:` variant
+ * is one someone forgets, and a forgotten `dark:` variant is a white
+ * card in a dark page.
+ *
+ * The consequence is a rule the codemod must respect absolutely:
+ *
+ *   **Never re-point `--color-white`.**
+ *
+ * `text-white` sits on brand fills — `bg-brand-600` buttons, the brand
+ * logo chip. White-on-rose is correct in *both* themes. If `--color-white`
+ * became the dark surface colour, every primary button would render
+ * dark-text-on-dark-rose. So the neutral ramp is split in two:
+ *
+ *   • **Surface / text** (`--neutral-50` … `--neutral-700`) — re-points
+ *     across themes. These are the "paper" colours.
+ *   • **Fill** (`--neutral-800`, `--neutral-900`) — stays dark in both
+ *     themes. These are the "ink" colours: a deliberately dark panel in
+ *     either mode.
+ *
+ * The `--color-*` names below are the semantic layer the components
+ * actually use. The raw `--neutral-*` ramp stays available for the rare
+ * case that needs a specific step.
+ */
+
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  /* ── Warm neutral canvas ─────────────────────────────────────────────
+   * A slightly warm off-white rather than pure #fff. Pure white against
+   * rose produces a cold, clinical feel; the warm ramp keeps the skin
+   * tones in the product photography looking natural. */
+  --background: #fdfbf9;
+  --foreground: #1c1917;
+
+  /* ── Semantic surfaces ─────────────────────────────────────────────────
+   * The four surfaces the whole UI is built from. A card is `surface`;
+   * a table stripe or an inset panel is `surface-muted`; the page canvas
+   * behind the cards is `surface-sunken`; a hairline is `border`.
+   *
+   * In the dark theme these invert: the canvas becomes the *darkest*
+   * tone and cards sit slightly *above* it, because a card must read as
+   * a raised surface, not a hole. */
+  --surface: #ffffff;
+  --surface-muted: #f5f5f4;
+  --surface-sunken: #fafaf9;
+  --surface-raised: #ffffff;
+  --border: #e7e5e4;
+
+  /* The secondary text colour. Separated from `--foreground` so that
+   * "muted" means *muted* in both themes — a muted label that is nearly
+   * invisible on a dark canvas is not muted, it is broken. */
+  --foreground-muted: #57534e;
+
+  /* ── The hero's ink ─────────────────────────────────────────────────────
+   * The hero panel is a **light poster in both themes**.
+   *
+   * Its gradients are pale washes and its artwork sits behind a white
+   * scrim, so the ground under the copy is always light — in the dark
+   * theme as much as in the light one. That makes the hero the one
+   * place on the site where the ordinary tokens are wrong: `text-
+   * foreground` becomes near-white in the dark theme, and near-white
+   * type on a near-white ground is unreadable.
+   *
+   * So the hero carries its own ink, and — like `--neutral-800` and
+   * `--neutral-900` — it does **not** re-point in the dark theme. Ink
+   * stays dark. A poster is printed once; it does not invert.
+   *
+   * The accent is the same argument: `brand-600` re-points to a *light*
+   * rose in the dark theme, and a pale rose on a pale ground is not an
+   * accent. The hero's accent is a deep rose that stays deep. */
+  --hero-ink: #1c1917;
+  --hero-ink-muted: #57534e;
+  --hero-accent: #be185d;
+  --hero-accent-strong: #9d174d;
+
+  /* ── Brand rose ──────────────────────────────────────────────────────── */
+  --brand-50: #fdf2f8;
+  --brand-100: #fce7f3;
+  --brand-200: #fbcfe8;
+  --brand-300: #f9a8d4;
+  --brand-400: #f472b6;
+  --brand-500: #ec4899;
+  --brand-600: #db2777;
+  --brand-700: #be185d;
+  --brand-800: #9d174d;
+  --brand-900: #831843;
+
+  /* ── Neutral ramp (warm stone) ─────────────────────────────────────────
+   * 50–700 are the SURFACE/TEXT scale and re-point in the dark theme.
+   * 800–900 are the FILL scale and stay dark in both themes. */
+  --neutral-50: #fafaf9;
+  --neutral-100: #f5f5f4;
+  --neutral-200: #e7e5e4;
+  --neutral-300: #d6d3d1;
+  --neutral-400: #a8a29e;
+  --neutral-500: #78716c;
+  --neutral-600: #57534e;
+  --neutral-700: #44403c;
+  --neutral-800: #292524;
+  --neutral-900: #1c1917;
+
+  /* ── Semantic ────────────────────────────────────────────────────────── */
+  --success: #16a34a;
+  --warning: #d97706;
+  --danger: #dc2626;
+  --info: #0284c7;
+
+  /* ── The chart palette ─────────────────────────────────────────────────
+   * A categorical ramp for the donut's slices and the chart's series.
+   *
+   * These live as CSS custom properties rather than as values baked into
+   * the SVG, and that is the whole point: the charts read them through
+   * `var()`, so **a theme flip repaints every chart in the same frame**
+   * — no JavaScript, no re-render, no state.
+   *
+   * The ramp is ordered so adjacent slices stay distinguishable: the
+   * rose leads (it is the brand), then a warm amber, a green, a violet
+   * and a slate. Each is separated enough in hue that two neighbouring
+   * slices never read as one.
+   *
+   * The dark theme re-points them lighter, for the same reason the
+   * brand does: a saturated mid-tone vibrates against near-black. */
+  --chart-1: #db2777;
+  --chart-2: #d97706;
+  --chart-3: #059669;
+  --chart-4: #7c3aed;
+  --chart-5: #0284c7;
+
+  /* The chart's grid lines and axis rules. Faint in both themes — a
+   * grid that competes with the data is a grid that hides it. */
+  --chart-grid: #e7e5e4;
 }
+
+/**
+ * The dark theme.
+ *
+ * Applied by adding `.dark` to the `<html>` element. The inline script in
+ * the root layout does this before first paint, so there is no flash.
+ *
+ * Only the surface/text scale moves. `--neutral-800` and `--neutral-900`
+ * deliberately do NOT change: they are the fill colours, and a brand
+ * button with `text-white` on it must stay legible in both themes.
+ */
+.dark {
+  --background: #0c0a09;
+  --foreground: #f5f5f4;
+
+  /* The canvas is the darkest tone; cards sit *above* it. */
+  --surface: #1c1917;
+  --surface-muted: #262220;
+  --surface-sunken: #0c0a09;
+  --surface-raised: #292524;
+  --border: #3a3533;
+
+  /* Muted text on a dark canvas is *lighter* than muted text on a light
+   * one, not darker. The same value would be unreadable in both. */
+  --foreground-muted: #a8a29e;
+
+  /* The surface/text scale inverts. */
+  --neutral-50: #1c1917;
+  --neutral-100: #262220;
+  --neutral-200: #3a3533;
+  --neutral-300: #44403c;
+  --neutral-400: #57534e;
+  --neutral-500: #78716c;
+  --neutral-600: #a8a29e;
+  --neutral-700: #d6d3d1;
+
+  /* The fill scale stays dark. See the header comment. */
+  --neutral-800: #292524;
+  --neutral-900: #1c1917;
+
+  /* The brand reads lighter on a dark canvas, because a saturated rose
+   * at the same lightness vibrates against near-black. */
+  --brand-50: #3b0a24;
+  --brand-100: #571232;
+  --brand-200: #7d1a49;
+  --brand-300: #a82465;
+  --brand-400: #d13284;
+  --brand-500: #ec4899;
+  --brand-600: #f472b6;
+  --brand-700: #f9a8d4;
+  --brand-800: #fbcfe8;
+  --brand-900: #fce7f3;
+
+  /* The semantic colours lighten for the same reason. */
+  --success: #4ade80;
+  --warning: #fbbf24;
+  --danger: #f87171;
+  --info: #38bdf8;
+
+  /* The chart palette lightens for the same reason as the brand. */
+  --chart-1: #f472b6;
+  --chart-2: #fbbf24;
+  --chart-3: #34d399;
+  --chart-4: #a78bfa;
+  --chart-5: #38bdf8;
+
+  --chart-grid: #3a3533;
+}
+
+/**
+ * Tailwind v4's first-class dark variant.
+ *
+ * With this registered, `dark:` works as a *targeted escape hatch* for
+ * the rare component that genuinely needs a theme-specific style — but
+ * the architecture does not rely on it. The token layer handles 99% of
+ * the theme, and `dark:` is the exception rather than the rule.
+ */
+@custom-variant dark (&:where(.dark, .dark *));
 
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
+  --color-foreground-muted: var(--foreground-muted);
+
+  /* ── The semantic surface scale ───────────────────────────────────────
+   * These four names are what components use. They are the *only*
+   * background colours a themed component should reach for. */
+  --color-surface: var(--surface);
+  --color-surface-muted: var(--surface-muted);
+  --color-surface-sunken: var(--surface-sunken);
+  --color-surface-raised: var(--surface-raised);
+  --color-border: var(--border);
+  /* Focus rings and table rules draw in the same hairline colour as a
+   * border, so they get the same token. */
+  --color-ring-border: var(--border);
+  --color-divide-border: var(--border);
+
+  --color-brand-50: var(--brand-50);
+  --color-brand-100: var(--brand-100);
+  --color-brand-200: var(--brand-200);
+  --color-brand-300: var(--brand-300);
+  --color-brand-400: var(--brand-400);
+  --color-brand-500: var(--brand-500);
+  --color-brand-600: var(--brand-600);
+  --color-brand-700: var(--brand-700);
+  --color-brand-800: var(--brand-800);
+  --color-brand-900: var(--brand-900);
+
+  /* ── The hero's own ink ──────────────────────────────────────────────────
+   * The hero panel is a light poster in both themes, so its type does
+   * not follow the theme's foreground. These are the tokens the hero
+   * uses, and they deliberately do **not** re-point in the dark theme. */
+  --color-hero-ink: var(--hero-ink);
+  --color-hero-ink-muted: var(--hero-ink-muted);
+  --color-hero-accent: var(--hero-accent);
+  --color-hero-accent-strong: var(--hero-accent-strong);
+
+  /* The full neutral ramp stays exposed, so a component that needs a
+   * specific step can still name it. Remember: 50–700 re-point across
+   * themes; 800–900 stay dark in both. */
+  --color-neutral-50: var(--neutral-50);
+  --color-neutral-100: var(--neutral-100);
+  --color-neutral-200: var(--neutral-200);
+  --color-neutral-300: var(--neutral-300);
+  --color-neutral-400: var(--neutral-400);
+  --color-neutral-500: var(--neutral-500);
+  --color-neutral-600: var(--neutral-600);
+  --color-neutral-700: var(--neutral-700);
+  --color-neutral-800: var(--neutral-800);
+  --color-neutral-900: var(--neutral-900);
+
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-danger: var(--danger);
+  --color-info: var(--info);
+
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
+
+  /* ── Radii ──────────────────────────────────────────────────────────────
+   * Generously rounded. A beauty storefront reads as modern and soft with
+   * rounded cards; the 1.5rem card radius is the single most recognisable
+   * shape in the layout. */
+  --radius-card: 1.5rem;
+  --radius-pill: 9999px;
+
+  /* ── Shadows ────────────────────────────────────────────────────────────
+   * Rose-tinted, never grey. A neutral shadow on a warm canvas reads as
+   * dirt; a rose shadow reads as light bouncing off the surface.
+   *
+   * Each shadow is **layered**: a tight contact shadow that grounds the
+   * element on the canvas, and a wide ambient shadow that lifts it into
+   * the air. A single-blur shadow reads as a flat sticker — it either
+   * grounds the element so hard it looks pasted on, or floats it so
+   * high it loses its contact with the page. The two-layer structure is
+   * what makes a card look like a physical object catching light.
+   *
+   * The ambient layer's blur and spread scale with the elevation, so a
+   * card at rest and the same card under the cursor read as the *same
+   * object at two heights* rather than as two different objects. */
+  --shadow-card:
+    0 1px 2px rgb(190 24 93 / 0.04), 0 2px 6px rgb(190 24 93 / 0.04),
+    0 8px 24px rgb(190 24 93 / 0.06);
+  --shadow-lift:
+    0 2px 4px rgb(190 24 93 / 0.05), 0 8px 16px rgb(190 24 93 / 0.06),
+    0 20px 48px rgb(190 24 93 / 0.12);
+  --shadow-brand: 0 4px 14px rgb(219 39 119 / 0.28);
+
+  /* ── The hero's shadow ──────────────────────────────────────────────────
+   * The hero is the tallest, widest object on the page, so it needs the
+   * deepest shadow of the three. The extra spread is what makes the
+   * hero read as *floating above* the page rather than as a panel
+   * sitting on it — the same object, one elevation higher. */
+  --shadow-hero:
+    0 2px 4px rgb(190 24 93 / 0.04), 0 12px 28px rgb(190 24 93 / 0.07),
+    0 36px 80px rgb(190 24 93 / 0.12);
+
+  /* ── Motion ─────────────────────────────────────────────────────────────
+   * Only two durations and one easing. A page with five easings feels
+   * unfinished.
+   *
+   * The second easing is reserved for the **carousel**: a cross-fade
+   * that also drifts the incoming slide very slightly upward as it
+   * settles. The ease is deliberately *slower out than in* — it spends
+   * most of its time near the start and arrives gently, which is what
+   * makes a slide feel like it is settling into place rather than
+   * sliding past. */
+  --ease-out-soft: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-carousel: cubic-bezier(0.22, 1, 0.36, 1);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
+@layer base {
+  html {
+    /* Smooth in-page anchors, but only when the user has not asked for
+     * reduced motion. */
+    scroll-behavior: smooth;
+
+    /* The canvas colour is set on `html` as well as `body`, so the area
+     * beyond the end of a short page matches the theme rather than
+     * flashing the light default. */
+    background-color: var(--background);
+  }
+
+  body {
+    background-color: var(--background);
+    color: var(--foreground);
+    font-family: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+    /* Stops the iOS Safari rubber-band from showing the canvas colour
+     * behind a short page. */
+    min-height: 100dvh;
+    /* Avoids a horizontal scroll when a child overflows on a small
+     * screen. */
+    overflow-x: hidden;
+    /* The theme swap must not animate. A 200ms transition on every
+     * element's colours is a smear, not a transition. */
+    transition: none;
+  }
+
+  /* A visible focus ring, for keyboard users only. `:focus-visible` means
+   * a mouse click does not draw the ring, but a Tab key does. */
+  :focus-visible {
+    outline: 2px solid var(--brand-600);
+    outline-offset: 2px;
+    border-radius: 0.25rem;
+  }
+
+  /* Respect the OS "reduce motion" setting. The decorative carousel and
+   * the shimmer are disabled; nothing that carries information is. */
+  @media (prefers-reduced-motion: reduce) {
+    html {
+      scroll-behavior: auto;
+    }
+
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
   }
 }
 
-body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+
+@layer components {
+  /* A horizontal scroller with no visible scrollbar. Used by the category
+   * rail, the brand carousel and the filter chips. The scrollbar is hidden
+   * but the element is still keyboard-scrollable, because
+   * `scrollbar-width: none` does not remove keyboard scrolling. */
+  .no-scrollbar {
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+
+  /* Clamp helpers for the product cards and the hero copy. */
+  .line-clamp-2 {
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+
+  .line-clamp-3 {
+    display: -webkit-box;
+    -webkit-line-clamp: 3;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+
+  /* The safe-area inset for the mobile bottom navigation, so it clears the
+   * iPhone home indicator. */
+  .pb-safe {
+    padding-bottom: max(0.5rem, env(safe-area-inset-bottom));
+  }
+}
+
+@layer utilities {
+  /* A subtle rose gradient used behind the hero and the promotional
+   * banners. */
+  .bg-brand-gradient {
+    background-image: linear-gradient(
+      135deg,
+      var(--brand-50) 0%,
+      var(--brand-100) 45%,
+      #fff7fb 100%
+    );
+  }
+
+  .bg-brand-gradient-deep {
+    background-image: linear-gradient(
+      135deg,
+      var(--brand-600) 0%,
+      var(--brand-800) 100%
+    );
+  }
+}
+
+/* The admin notification toast's entrance.
+ *
+ * A short rise-and-fade. It is deliberately small: a toast that
+ * animates for half a second draws more attention than the order it is
+ * reporting, and the whole point is to inform without interrupting.
+ *
+ * The animation is declared outside `@layer utilities` so it is not
+ * purged — Tailwind v4 only keeps the keyframes that a utility
+ * references, and the utility references it by name.
+ */
+@keyframes notification-toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(0.5rem) scale(0.98);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+/* The announcement marquee's scroll.
+ *
+ * The track holds **two equal copies** of the message, and the
+ * animation moves it by exactly **half of itself** — which is exactly
+ * one copy. When the first copy has scrolled fully out of view, the
+ * second is precisely where the first started, so the loop is seamless
+ * and the strip never shows a gap.
+ *
+ * The translation is a **percentage of the element's own width**, not a
+ * pixel value, because the width is not known until the text has been
+ * laid out. A percentage keeps the seam exact whatever the message
+ * says.
+ *
+ * `transform` is the property used rather than `left` or `margin`,
+ * because `transform` is the one the compositor can animate without
+ * touching layout — the scroll stays smooth on a cheap phone.
+ *
+ * The animation is declared outside `@layer utilities` so it is not
+ * purged — Tailwind v4 only keeps the keyframes that a utility
+ * references, and the utility references it by name.
+ */
+@keyframes marquee-scroll {
+  from {
+    transform: translateX(0);
+  }
+
+  to {
+    transform: translateX(-50%);
+  }
 }

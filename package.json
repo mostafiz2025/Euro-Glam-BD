@@ -8,6 +8,23 @@
     "start": "next start",
     "lint": "eslint",
     "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "verify:step8": "tsx scripts/verify-step8.ts",
+    "verify:step9": "tsx scripts/verify-step9.ts",
+    "verify:step10": "tsx scripts/verify-step10.ts",
+    "verify:step12": "tsx scripts/verify-step12.ts",
+    "verify:step13": "tsx scripts/verify-step13.ts",
+    "verify:advisor": "tsx scripts/verify-advisor.ts",
+    "verify:gemini": "tsx scripts/verify-gemini.ts",
+    "verify:openrouter": "tsx scripts/verify-openrouter.ts",
+    "verify:openrouter:conversation": "tsx scripts/verify-openrouter-conversation.ts",
+    "probe:openrouter:vision": "tsx scripts/probe-vision.ts",
+    "probe:openrouter:tools": "tsx scripts/probe-tools.ts",
+    "probe:openrouter:endpoints": "tsx scripts/probe-endpoints.ts",
+    "probe:openrouter:channels": "tsx scripts/probe-channels.ts",
+    "probe:openrouter:credits": "tsx scripts/probe-credits.ts",
+    "verify:conversation": "tsx scripts/verify-conversation.ts",
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate dev",
     "db:deploy": "prisma migrate deploy",
@@ -16,19 +33,23 @@
     "db:reset": "prisma migrate reset --force"
   },
   "dependencies": {
+    "@google/genai": "^2.32.0",
     "@prisma/client": "^6.19.0",
     "bcryptjs": "^3.0.2",
     "dotenv": "^16.4.7",
     "jose": "^6.1.0",
     "next": "16.4.3",
+    "nodemailer": "^10.3.1",
     "react": "19.3.0",
     "react-dom": "19.3.0",
+    "sslcommerz-lts": "^1.2.0",
     "zod": "^4.1.13"
   },
   "devDependencies": {
     "@tailwindcss/turbopack": "^4",
     "@types/bcryptjs": "^2.4.6",
     "@types/node": "^20",
+    "@types/nodemailer": "^8.0.2",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "eslint": "^9",
@@ -36,6 +57,7 @@
     "prisma": "^6.19.0",
     "tailwindcss": "^4",
     "tsx": "^4.20.6",
-    "typescript": "^5"
+    "typescript": "^5",
+    "vitest": "^3.2.4"
   }
 }

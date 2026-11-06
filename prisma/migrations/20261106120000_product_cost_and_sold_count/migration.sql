@@ -1,0 +1,156 @@
+-- Inventory, cost tracking and profit accounting.
+--
+-- Four additive column changes across two tables, plus the indexes the new
+-- admin inventory screen reads by.
+--
+-- ── 1. `products.purchasePricePaisa` ──────────────────────────────────────
+--
+-- What the shop **paid** for one unit of the product.
+--
+-- ── Why it is `Int` and not `Float` ───────────────────────────────────────
+--
+-- The request that prompted this feature asked for a `Float`. The
+-- schema's own header says why it is not doing that:
+--
+-- > Money is Int in poisha (1 BDT = 100 poisha). Never Float, never Decimal.
+--
+-- and DECISIONS.md records the same rule as a derived engineering rule:
+--
+-- > Money is `Int` in the smallest unit (poisha), never `Float`. ... `Float`
+-- > is excluded because binary floating point cannot represent decimal
+-- > amounts exactly and sums drift.
+--
+-- A float purchase price would put this column outside the one money
+-- convention the codebase holds to, and the drift it introduces would
+-- land directly on the **profit** figure — the number this feature
+-- exists to produce. A margin computed from a float cost is a margin
+-- that does not reconcile against a supplier invoice to the paisa.
+--
+-- So the column is integer poisha, like every other money column in this
+-- schema. 1 BDT = 100 poisha, and `formatPaisa` renders it.
+--
+-- ── Why it is nullable ───────────────────────────────────────────────────
+--
+-- A product the shop has not bought yet has no purchase price. `NULL`
+-- means "not known", which is a truthful value.
+--
+-- A non-null default of `0` would be a lie: it would say the product
+-- cost nothing, and a margin computed against it would report a 100%
+-- profit on a product the shop paid real money for. So the profit
+-- figures **exclude** products with no recorded cost rather than
+-- counting them at zero — see `src/lib/admin/profit.ts`.
+--
+-- ── Why there is no backfill ─────────────────────────────────────────────
+--
+-- The existing catalogue's costs are not in the database. A backfill
+-- would have to invent them, and an invented cost produces an invented
+-- profit — which is worse than no profit figure at all, because it looks
+-- real.
+--
+-- The column starts empty, and an admin fills it in on the product form.
+--
+-- ── 2. `products.sellingPricePaisa` ───────────────────────────────────────
+--
+-- What the customer is actually **charged** for one unit.
+--
+-- This is separate from `pricePaisa` (the list price) and from
+-- `discountPricePaisa` (the sale price) because the selling price is
+-- what the margin arithmetic should use, and on a product that is
+-- currently discounted that is the *discounted* price — not the list
+-- price the margin would otherwise be computed against.
+--
+-- Nullable for the same reason as the purchase price: a product that is
+-- not yet priced for sale has no selling price.
+--
+-- ── 3. `products.soldCount` ──────────────────────────────────────────────
+--
+-- How many units of this product have been sold.
+--
+-- The obvious alternative is a `COUNT` over `order_items` joined on the
+-- product, which would give the same number. But the admin inventory
+-- screen needs that number for *every* product on the page, and a
+-- per-product count is a per-product query. So the counter is
+-- maintained at the point of sale, where the quantity is already in
+-- hand: incremented when an order is placed, decremented when the order
+-- is cancelled.
+--
+-- It is a **convenience figure**, not an accounting record. The
+-- authoritative figure is always the sum of the order items, and the
+-- profit numbers are computed from the order items rather than from
+-- this column — so a counter that drifted would misreport a popularity
+-- ranking but could never misreport the shop's money.
+--
+-- The default is `0`, which is the truthful value for every existing
+-- product: none of them has been sold through the system yet. (The
+-- seeded catalogue carries no orders.)
+--
+-- ── 4. `order_items.purchasePricePaisa` ──────────────────────────────────
+--
+-- The product's cost **at the moment of the sale**, snapshotted onto the
+-- line.
+--
+-- It is snapshotted for the same reason `pricePaisa` already is: the
+-- catalogue's cost moves — suppliers change their prices, the shop
+-- renegotiates — and a profit figure for a sale made last quarter must
+-- not silently change when the current supplier price does.
+--
+-- Nullable for the same reason as the product's own cost column. A line
+-- with no recorded cost is **excluded** from the profit arithmetic
+-- rather than counted at zero cost.
+--
+-- ── 5. `order_items.discountAmountPaisa` ─────────────────────────────────
+--
+-- The **extra** discount given away on this line, in poisha — the
+-- coupon's share of the order, allocated to the line.
+--
+-- It is a snapshot rather than a derivation because a line's discount
+-- can come from more than the product's own `discountPricePaisa`: a
+-- coupon is applied to the order as a whole, and splitting that coupon
+-- across the lines is an allocation rule, not a fact about the product.
+-- What is recorded here is the discount that was actually applied to
+-- this line at the moment the order was placed.
+--
+-- The product's **own** discount is not repeated here, because
+-- `order_items.pricePaisa` is already the price the customer paid — it
+-- is written as `discountPricePaisa ?? pricePaisa` at the moment the
+-- order is placed, so it is already net of the product's discount.
+--
+-- So the margin arithmetic is:
+--
+--     profit = (pricePaisa - purchasePricePaisa - discountAmountPaisa) × quantity
+--
+-- where `pricePaisa` is the selling price the customer actually paid
+-- per unit.
+--
+-- The default is `0`, which means "no coupon was applied to this
+-- line" — the ordinary case. It is **not** the same as "unknown", and
+-- that is why it is a non-null column with a zero default rather than a
+-- nullable one.
+--
+-- Existing rows keep `0`: they predate the feature, and the only
+-- honest thing to say about their line-level discount is that none was
+-- recorded.
+--
+-- ── The indexes ──────────────────────────────────────────────────────────
+--
+-- `products_soldCount_idx` — the inventory screen sorts by "best
+-- selling", so the counter is read as an ordering key.
+--
+-- `order_items_purchasePricePaisa_idx` — the profit queries filter on
+-- lines that have a recorded cost, and the column is nullable precisely
+-- so that "has a cost" is a cheap predicate rather than a scan.
+
+-- AlterTable
+ALTER TABLE "products" ADD COLUMN     "purchasePricePaisa" INTEGER,
+ADD COLUMN     "sellingPricePaisa" INTEGER,
+ADD COLUMN     "soldCount" INTEGER NOT NULL DEFAULT 0;
+
+-- AlterTable
+ALTER TABLE "order_items" ADD COLUMN     "purchasePricePaisa" INTEGER,
+ADD COLUMN     "discountAmountPaisa" INTEGER NOT NULL DEFAULT 0;
+
+-- The best-selling sort reads the counter as an ordering key.
+CREATE INDEX "products_soldCount_idx" ON "products"("soldCount");
+
+-- The profit queries filter on lines that have a recorded cost.
+CREATE INDEX "order_items_purchasePricePaisa_idx" ON "order_items"("purchasePricePaisa");

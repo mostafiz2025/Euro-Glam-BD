@@ -1,0 +1,86 @@
+-- The payment gateway's session token and transaction reference.
+--
+-- Two nullable columns on `orders`:
+--
+--   1. `paymentGatewaySessionId` — the bearer token the browser holds while
+--      the sandbox payment window is open.
+--
+--   2. `paymentGatewayTransactionId` — the gateway's own reference, written
+--      when a gateway payment succeeds.
+--
+-- ── Why the token is stored in the clear, not hashed ───────────────────────
+--
+-- The reflex is to hash a token. That reflex is wrong here, and the reason
+-- is worth writing down so it is not "fixed" later.
+--
+-- A hash is only useful when the server must compare an
+-- attacker-supplied value against a stored digest *without* the plaintext
+-- being recoverable, AND the secret must survive repeated use. That is the
+-- password case, and it is exactly what `users.passwordHash` does —
+-- bcrypt, because it is verified again and again and never leaves the
+-- server.
+--
+-- This token is different in every way that matters:
+--
+--   • It is used **exactly once**. The settle endpoint consumes it and
+--     clears the column in the same transaction that marks the order PAID.
+--     There is no second use, so there is no stored credential for an
+--     attacker to attack offline, and no reason for the server to be unable
+--     to hold the plaintext.
+--
+--   • It authorises **one transition on one order**, and only while that
+--     order's payment is still PENDING. It is a one-shot capability, not a
+--     session and not a credential.
+--
+--   • The audit trail wants to name it. "Which gateway session settled this
+--     order?" is a question the trail should be able to answer, and a digest
+--     is not a readable reference.
+--
+-- The codebase's own precedent agrees: `orders.orderNumber` is an
+-- unguessable, human-quotable reference stored in the clear, generated with
+-- `crypto.randomUUID()` rather than `Math.random` for exactly this reason.
+-- The token follows that precedent.
+--
+-- The security comes from three things instead of from hashing:
+-- unguessability (128 bits from `crypto.randomUUID`), one-shot use (the
+-- column is nulled on settle), and the customer-scoped ownership check in
+-- the settle endpoint (the token alone is not enough — the caller must also
+-- own the order).
+--
+-- ── Why it is nullable ─────────────────────────────────────────────────────
+--
+-- A COD order never opens a gateway session. So does a non-COD order whose
+-- session has been consumed by a successful settle. A NULL here means "there
+-- is no live gateway session on this order" — not "the data is missing".
+--
+-- ── Why it is unique ───────────────────────────────────────────────────────
+--
+-- A `@unique` index makes the token safe to look up directly and makes a
+-- collision a database error rather than an ambiguity. PostgreSQL treats
+-- NULLs as distinct, so every order without a live session is unaffected —
+-- only one order can hold a given token.
+--
+-- ── Why the gateway reference is a separate column ─────────────────────────
+--
+-- `paymentTransactionId` is the *customer's* transfer reference: the TrxID
+-- bKash and Nagad show on their confirmation screen. The gateway issues its
+-- own reference, and putting that server-minted value in the customer's
+-- column would:
+--
+--   • break the rule that a `CARD` order carries no customer-side
+--     reference (the validation schema refuses a stray TrxID on a card
+--     order, and the database would then disagree with the schema), and
+--
+--   • make the two references indistinguishable in the admin console, so
+--     support staff could not tell which number the customer quoted and
+--     which one the gateway issued.
+--
+-- For a bKash or Nagad order BOTH columns are populated. For a card order
+-- only the gateway's is.
+
+-- AlterTable
+ALTER TABLE "orders" ADD COLUMN     "paymentGatewaySessionId" VARCHAR(64),
+ADD COLUMN     "paymentGatewayTransactionId" VARCHAR(64);
+
+-- CreateIndex
+CREATE UNIQUE INDEX "orders_paymentGatewaySessionId_key" ON "orders"("paymentGatewaySessionId");

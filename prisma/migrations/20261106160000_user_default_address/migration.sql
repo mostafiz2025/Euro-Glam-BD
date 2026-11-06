@@ -1,0 +1,33 @@
+-- The customer's saved delivery address.
+--
+-- ── Why this column exists ─────────────────────────────────────────────────
+--
+-- `Order.shippingAddress` is a **snapshot**: the address an order was
+-- actually delivered to, frozen at the moment the order was placed. That
+-- is correct for an order — the invoice for a March order still shows the
+-- address as it was in March — but it means a customer has no way to
+-- record "this is where I live". Every order means re-typing the same
+-- seven fields.
+--
+-- This column is that answer: the **default** address, editable at
+-- `/account/settings` and used to pre-fill the checkout.
+--
+-- ── Why it is `Json` and not seven columns ────────────────────────────────
+--
+-- The shape is the shape the checkout already validates
+-- (`shippingAddressSchema` in `src/lib/validation/commerce.ts`). Keeping
+-- it as one untyped object means the checkout's address and the saved
+-- address share a single definition of the shape, and the two cannot
+-- drift apart.
+--
+-- ── Why `NULL` means "not set yet" ────────────────────────────────────────
+--
+-- A customer who has never saved an address has `NULL` here, and the
+-- checkout falls back to an empty form exactly as it does today.
+--
+-- ── It is not a delivery instruction ──────────────────────────────────────
+--
+-- Saving an address here does **not** change where any existing order is
+-- going. The order's own snapshot is what the courier works from.
+
+ALTER TABLE "users" ADD COLUMN "defaultAddress" JSONB;

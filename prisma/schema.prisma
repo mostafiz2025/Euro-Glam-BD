@@ -55,6 +55,15 @@ enum PaymentStatus {
   REFUNDED
 }
 
+/// The outcome of one attempt to pay for an order through the gateway.
+enum PaymentAttemptOutcome {
+  /// The gateway accepted the payment.
+  SUCCESS
+  /// The gateway declined it. The order is unaffected — the payment
+  /// stays PENDING and the customer may try again.
+  FAILED
+}
+
 enum MessageRole {
   USER
   ASSISTANT
@@ -71,6 +80,90 @@ enum SkinType {
   UNKNOWN
 }
 
+/// The privileged actions an admin can take. A closed set: every value
+/// here is something the platform can do and can be audited for.
+enum AdminAction {
+  /// A review was approved and made public.
+  REVIEW_APPROVED
+  /// A published review was withdrawn from the storefront.
+  REVIEW_HIDDEN
+  /// A hidden review was published again.
+  REVIEW_UNHIDDEN
+  /// An order's fulfilment status moved.
+  ORDER_STATUS_CHANGED
+  /// An order's payment status moved.
+  ORDER_PAYMENT_STATUS_CHANGED
+  /// An order's payment was settled through the payment gateway — by the
+  /// customer, not by staff. Distinct from ORDER_PAYMENT_STATUS_CHANGED,
+  /// which records a staff member's decision.
+  ORDER_PAYMENT_GATEWAY_SETTLED
+  /// An order was cancelled, and its stock restored.
+  ORDER_CANCELLED
+  /// A depletion-reminder sweep was run.
+  SMS_REMINDER_SWEEP
+  /// A depletion reminder was sent.
+  SMS_REMINDER_SENT
+  /// A depletion reminder was resent by hand.
+  SMS_REMINDER_RESENT
+  /// A product's stock quantity was changed by hand.
+  PRODUCT_STOCK_ADJUSTED
+  /// A product was added to the catalogue.
+  PRODUCT_CREATED
+  /// A product's details were changed.
+  PRODUCT_UPDATED
+  /// A product was removed — archived, or hard-deleted.
+  PRODUCT_DELETED
+  /// The AI advisor's configuration was changed.
+  AI_CONFIG_UPDATED
+  /// A discount coupon was created.
+  COUPON_CREATED
+  /// A discount coupon's terms were changed.
+  COUPON_UPDATED
+  /// A discount coupon was deactivated or deleted.
+  COUPON_DELETED
+  /// A category was added to the catalogue.
+  CATEGORY_CREATED
+  /// A category's details were changed.
+  CATEGORY_UPDATED
+  /// A category was removed.
+  CATEGORY_DELETED
+  /// A skin concern was added.
+  CONCERN_CREATED
+  /// A skin concern's details were changed.
+  CONCERN_UPDATED
+  /// A skin concern was removed.
+  CONCERN_DELETED
+  /// A brand was added to the vocabulary.
+  BRAND_CREATED
+  /// A brand's details were changed.
+  BRAND_UPDATED
+  /// A brand was removed from the vocabulary.
+  BRAND_DELETED
+  /// An order's payment was settled through the SSLCOMMERZ gateway, on
+  /// the strength of a gateway-validated callback.
+  ///
+  /// Distinct from `ORDER_PAYMENT_GATEWAY_SETTLED`, which records the
+  /// customer settling through the shop's own simulated gateway window.
+  /// The two are different actors writing to the same column, and the
+  /// trail has to be able to say which one happened.
+  ORDER_PAYMENT_SSLCOMMERZ_SETTLED
+  /// A homepage hero banner was created.
+  HERO_BANNER_CREATED
+  /// A homepage hero banner's details were changed.
+  HERO_BANNER_UPDATED
+  /// A homepage hero banner was removed.
+  HERO_BANNER_DELETED
+  /// The shop's site settings were changed — the announcement marquee's
+  /// switch, its text, or its link.
+  SITE_SETTINGS_UPDATED
+  /// An administrator changed **their own** profile details — the name
+  /// shown in the top bar, or the telephone number on their account.
+  ///
+  /// Distinct from the shop's settings: a profile edit affects one
+  /// person, and the shop's settings affect every customer.
+  ADMIN_PROFILE_UPDATED
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Users & Auth
 // ─────────────────────────────────────────────────────────────────────────────
@@ -84,19 +177,222 @@ model User {
   role         UserRole @default(CUSTOMER)
 
   /// Explicit SMS consent (locked decision #9). Default false.
+  ///
+  /// This is the ONLY flag that authorises the platform to send a
+  /// depletion reminder to a customer. The sweep asserts it in the
+  /// claim query's WHERE clause, so a customer who opts out mid-sweep
+  /// is still protected.
+  ///
+  /// The default of `false` is a genuine refusal here, not "not yet
+  /// asked" — the signup form asks, and a customer who never answers
+  /// has not consented.
   smsOptIn Boolean @default(false)
+
+  /// When the customer proved they own this inbox.
+  ///
+  /// ── Why null means "not yet verified", and not "no" ──────────────────────
+  /// A `Boolean` cannot tell "we never asked" from "they said no". A
+  /// timestamp can: `null` is a question that has not been answered yet,
+  /// and a set timestamp is an answer that was given.
+  ///
+  /// The distinction matters because the shop **requires** the answer.
+  /// A new account is created unverified, and the customer is mailed a
+  /// six-digit code; the account becomes usable when the code comes back.
+  /// That is what stops an address being registered by somebody else —
+  /// a typo'd address, or an address harvested from a forum — from
+  /// receiving the customer's order confirmations.
+  ///
+  /// The seeded administrator is verified from the start: an admin who
+  /// cannot receive mail cannot be reached by the shop either.
+  emailVerifiedAt DateTime?
+
+  /// The customer's **saved delivery address**.
+  ///
+  /// ── Why the address is on the account and not only on the order ────────
+  ///
+  /// `Order.shippingAddress` holds the address an order was actually
+  /// delivered to, and it is a **snapshot**: it is never rewritten, so the
+  /// invoice for an order from March still shows the address as it was in
+  /// March. That is exactly right for an order.
+  ///
+  /// But it leaves a customer with no way to say "this is where I live" —
+  /// every order means re-typing the same seven fields. This column is
+  /// that answer: the **default** address, pre-filled into the checkout
+  /// form and editable at `/account/settings`.
+  ///
+  /// ── Why it is `Json` and not seven columns ──────────────────────────────
+  ///
+  /// The shape is the same shape the checkout already validates
+  /// (`shippingAddressSchema` in `src/lib/validation/commerce.ts`), and
+  /// that schema is the only thing that may write this column. Keeping
+  /// it as one untyped object means the checkout's address and the
+  /// saved address cannot drift apart — there is one definition of the
+  /// shape, and both places use it.
+  ///
+  /// ── Why `null` means "not set yet" ─────────────────────────────────────
+  ///
+  /// A customer who has never saved an address has `null` here. The
+  /// checkout falls back to an empty form, exactly as it does today.
+  ///
+  /// ── It is not a delivery instruction ───────────────────────────────────
+  ///
+  /// Saving an address here does **not** change where any existing order
+  /// is going. The order's own snapshot is what the courier works from.
+  defaultAddress Json?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  cart              Cart?
-  orders            Order[]
-  reviews           Review[]
-  skinProfile       UserSkinProfile?
+  cart                 Cart?
+  orders               Order[]
+  reviews              Review[]
+  skinProfile          UserSkinProfile?
   advisorConversations AdvisorConversation[]
+  auditEntries         AdminAuditLog[]
+  emailOtps            EmailOtp[]
 
   @@index([role])
   @@map("users")
+}
+
+/// A record of one request for a sign-in code.
+///
+/// ── Why this is a table and not a counter on the OTP row ────────────────
+/// The cooldown on a resend **cannot** be counted on the `EmailOtp` row,
+/// because an address that has no account never gets an OTP row. That is
+/// precisely the address an attacker would probe, so a cooldown that only
+/// applies to real customers is not a cooldown at all — it is a limit that
+/// excludes exactly the traffic it exists to stop.
+///
+/// So the *attempts* are recorded separately, and every request writes a
+/// row here whether or not it produced a code. The cooldown is then a
+/// question about this table, and it answers identically for an address
+/// with an account and one without.
+///
+/// ── What this table deliberately does not hold ───────────────────────────
+/// It holds the **address** and the **time**. It does not hold whether the
+/// address had an account, and it does not hold whether a code was sent.
+/// A table that recorded the outcome would be a table that says which
+/// addresses belong to customers, which is the very thing the endpoint
+/// must not reveal.
+///
+/// ── Why the address is stored at all ─────────────────────────────────────
+/// The cooldown is per address, so the limit has to be counted per
+/// address. The address is not a secret — it is the thing the customer
+/// typed — and the table is pruned aggressively (see `pruneExpiredOtps`).
+model EmailOtpAttempt {
+  id String @id @default(cuid())
+
+  /// The address the request was made for.
+  email String @db.VarChar(255)
+
+  /// When the request was made.
+  createdAt DateTime @default(now())
+
+  /// The cooldown is counted per address, so this lookup must be indexed.
+  @@index([email])
+  /// The sweep that deletes old attempts walks this column.
+  @@index([createdAt])
+  @@map("email_otp_attempts")
+}
+
+/// A one-time password issued for the email sign-in flow.
+///
+/// ── Why the code is hashed, and never stored in the clear ───────────────
+/// This table is a list of live credentials. It sits in the same database
+/// as customers, addresses and orders, and a dump of it is a list of
+/// credentials that work for as long as they have not expired. Storing
+/// the six digits in the clear would make that dump directly replayable.
+///
+/// So the code is stored as a SHA-256 hash. The hash is salted with the
+/// row's own id, which means two customers who happen to be issued the
+/// same six digits do not produce the same stored value, and a lookup
+/// table of "123456 → this customer" cannot be built from the table.
+///
+/// ── Why the row is deleted on use, rather than flagged ─────────────────
+/// A verified OTP is worthless. Keeping it around — even as a consumed
+/// row — only widens the window in which a leaked hash is useful, and
+/// gives an attacker a second thing to steal. The row is deleted at the
+/// moment it is verified.
+///
+/// ── Why `expiresAt` and not a duration ──────────────────────────────────
+/// The expiry is a property of the *record*, not of the request. Storing
+/// the absolute instant means the deadline survives a process restart,
+/// and means a later query — "is this still live?" — does not have to
+/// reconstruct the duration from a configuration value that may since
+/// have changed.
+model EmailOtp {
+  id String @id @default(cuid())
+
+  /// The customer the code was issued for.
+  userId String @db.VarChar(64)
+
+  /// What this code is for.
+  ///
+  /// ── Why the purpose is on the row ────────────────────────────────────────
+  /// The shop mails a code for two different jobs: proving a **new**
+  /// account's owner can reach the inbox it was created with (SIGNUP),
+  /// and letting an **existing** customer sign in without a password
+  /// (SIGNIN).
+  ///
+  /// Those are different credentials, and a code issued for one must not
+  /// work for the other. Without this column, a signup code would be a
+  /// valid sign-in code — which means an attacker who intercepts the
+  /// verification mail of somebody who is registering could use it to
+  /// sign in later, and a customer who asked for a sign-in code could
+  /// spend it proving an account is theirs instead.
+  ///
+  /// The purpose is therefore part of the lookup, not a note on it: a
+  /// verification only ever reads the row whose purpose matches.
+  purpose OtpPurpose
+
+  /// The SHA-256 hash of the six-digit code, hex encoded, salted with
+  /// this row's `id`. Never the code itself.
+  codeHash String @db.VarChar(64)
+
+  /// The address the code was mailed to.
+  ///
+  /// Recorded on the row rather than looked up through the user, because
+  /// the address a code was sent to is what the verification step must
+  /// match — and if the address changed between the request and the
+  /// verification, the code is no longer for the account it was issued
+  /// against.
+  email String @db.VarChar(255)
+
+  /// When the code stops being valid.
+  expiresAt DateTime
+
+  /// How many times the code has been tried and rejected.
+  ///
+  /// A six-digit code has a million possible values, so brute force is
+  /// not hopeless when the code lives for ten minutes. The counter
+  /// caps it: five wrong guesses and the row is dead, no matter how
+  /// much time is left on the clock.
+  attempts Int @default(0)
+
+  /// When the code was issued.
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// The verification step looks up "the live code for this address,
+  /// for this purpose", so that lookup must be indexed.
+  @@index([email, purpose])
+  @@index([userId])
+  /// The sweep that deletes expired rows walks this column.
+  @@index([expiresAt])
+  @@map("email_otps")
+}
+
+/// What a one-time password is for.
+enum OtpPurpose {
+  /// Proving that the person registering owns the inbox they registered
+  /// with. Spent once; the account becomes usable.
+  SIGNUP
+
+  /// Signing in to an account that already exists. The account's own
+  /// password is not needed, and is never touched.
+  SIGNIN
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -104,29 +400,305 @@ model User {
 // ─────────────────────────────────────────────────────────────────────────────
 
 model Category {
-  id       String  @id @default(cuid())
-  name     String  @db.VarChar(120)
-  slug     String  @unique @db.VarChar(140)
+  id   String @id @default(cuid())
+  name String @db.VarChar(120)
+  slug String @unique @db.VarChar(140)
+
+  /// Storage adapter key for the category's card image — NOT a raw URL,
+  /// so the driver can be swapped without rewriting every row.
+  ///
+  /// **Null means "no image".** The storefront falls back to the SVG icon
+  /// keyed by slug (`CATEGORY_ICONS`), and a category with no icon entry
+  /// falls back further still. The icon table decorates the catalogue;
+  /// it never gates it — and an uploaded image is the same kind of
+  /// enhancement, only better.
+  image String? @db.VarChar(255)
 
   products Product[]
 
   @@map("categories")
 }
 
-model Product {
-  id          String   @id @default(cuid())
-  name        String   @db.VarChar(220)
-  description String   @db.Text
+/// A skin concern — the "Shop By Concern" discovery section.
+///
+/// **Why this is a table and not a static array.** The concerns used to
+/// live in `src/lib/format/taxonomy.ts`, which meant an admin could not
+/// add one, edit one, or give one a picture. The storefront's
+/// "Shop By Concern" section is a discovery surface, so its entries are
+/// content — and content belongs where an admin can manage it.
+///
+/// The vocabulary is closed in the sense that the *ingredient tags* are
+/// canonical: `tag` must be one of the IDs in
+/// `src/lib/conflicts/catalogue.ts`, so a concern filter and a conflict
+/// rule always agree about what "BHA" means. But the set of concerns
+/// themselves, their names, their descriptions and their images are the
+/// shop's to decide.
+model SkinConcern {
+  id String @id @default(cuid())
 
-  categoryId  String
-  category    Category @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  /// The shopper-facing label — "Acne", "Fine Lines".
+  name String @db.VarChar(80)
+
+  /// The slug the storefront links to — "acne", "fine-lines".
+  slug String @unique @db.VarChar(100)
+
+  /// The canonical ingredient ID this concern's family is led by — "BHA".
+  ///
+  /// This is the **ingredient** axis: it says what the concern's
+  /// products tend to contain, and it is what the conflict engine
+  /// compares against.
+  ///
+  /// It is **not** what the concern's browse page filters on. That page
+  /// filters on the **slug**, against `Product.concernSlugs` — because a
+  /// shopper clicking "Acne" is asking "which of these are for acne?",
+  /// and a product that merely contains salicylic acid is not thereby an
+  /// acne product. The two questions are different, and only the slug
+  /// answers the one the shopper asked.
+  tag String @db.VarChar(60)
+
+  /// The other tags in this family, offered in the filter panel.
+  relatedTags String[] @default([])
+
+  /// Storage adapter key for the concern's card image — NOT a raw URL.
+  ///
+  /// Null means "no image", and the storefront renders the concern as a
+  /// plain chip — the same presentation it has always had.
+  image String? @db.VarChar(255)
+
+  /// A short line shown on the card.
+  description String? @db.VarChar(200)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("skin_concerns")
+}
+
+/// A brand — the "Shop By Brand" discovery section.
+///
+/// **Why this does not change `Product.brand`.** Step 16 deliberately made
+/// `Product.brand` a plain nullable string rather than a foreign key: a
+/// `Brand` table would mean a join on every product read and a migration
+/// rewriting every seeded row. That decision stands.
+///
+/// This table holds the *presentation* data — the logo, the monogram, the
+/// display name, the ordering — and the product still stores the brand
+/// **name** it was given. `Brand.name` is the canonical spelling, and the
+/// two are kept in agreement by canonicalising on write with the same
+/// `canonicalBrand` the product path uses.
+///
+/// The logo column is nullable and **the monogram is the fallback**, not a
+/// removed feature: shipping a trademarked logo requires permission, so a
+/// brand with no uploaded logo still renders — it renders its monogram.
+model Brand {
+  id String @id @default(cuid())
+
+  /// The canonical spelling — "CeraVe", "La Roche-Posay".
+  ///
+  /// This is the string `Product.brand` holds.
+  name String @unique @db.VarChar(80)
+
+  /// The slug the storefront links to — "cerave", "la-roche-posay".
+  slug String @unique @db.VarChar(100)
+
+  /// The two-letter monogram shown when no logo is uploaded.
+  ///
+  /// "La Roche-Posay" → "LR" is a house convention, not a derivation, so
+  /// it is written out rather than computed.
+  monogram String @db.VarChar(4)
+
+  /// Storage adapter key for the brand's logo — NOT a raw URL.
+  ///
+  /// Null means "no logo", and the storefront falls back to the monogram.
+  /// Only upload a logo the shop has permission to use.
+  logo String? @db.VarChar(255)
+
+  /// A short line shown on the brand card.
+  description String? @db.VarChar(200)
+
+  /// The display order on the storefront. Lower comes first.
+  sortOrder Int @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("brands")
+}
+
+/// A homepage hero banner — one slide of the storefront's carousel.
+///
+/// **Why this is a table and not a config file.** The hero used to be a
+/// hard-coded array in `src/components/home/hero-slides.ts`: four slides
+/// decided in code and shipped with the code. An admin could not change a
+/// headline, add a campaign, or retire a slide without a deploy. So the
+/// slides moved into the database, where the admin panel can manage them.
+///
+/// **Why the banner keeps its own copy rather than pointing at a
+/// product.** A hero slide is an *editorial* unit — a headline, a body, two
+/// calls to action and a set of trust points. It is not a product. A
+/// banner may promote a category, a campaign, or the advisor, and the
+/// product mockup beside it is resolved separately from the catalogue.
+/// So the copy lives here, and only the *picture* is a stored file.
+model HeroBanner {
+  id String @id @default(cuid())
+
+  /// The eyebrow — the brand or campaign name above the headline.
+  eyebrow String @db.VarChar(80)
+
+  /// The headline.
+  title String @db.VarChar(160)
+
+  /// The supporting line.
+  body String @db.VarChar(400)
+
+  /// The primary call to action's label.
+  ctaLabel String @db.VarChar(60)
+
+  /// The primary call to action's destination — a path within the shop.
+  ctaHref String @db.VarChar(255)
+
+  /// The secondary call to action's label.
+  secondaryCtaLabel String @db.VarChar(60)
+
+  /// The secondary call to action's destination.
+  secondaryCtaHref String @db.VarChar(255)
+
+  /// The trust points shown under the calls to action.
+  ///
+  /// A plain array of strings, because a trust point is a phrase and not
+  /// an entity — there is nothing to join to.
+  trust String[] @default([])
+
+  /// Storage adapter key for the banner's background image — NOT a raw URL.
+  ///
+  /// Null means "no image", and the storefront falls back to the banner's
+  /// gradient wash. The image is the *background*, never the subject: the
+  /// copy is laid over it, so it is stored as a key and rendered behind a
+  /// scrim.
+  image String? @db.VarChar(255)
+
+  /// The gradient wash used when there is no image, and as the base layer
+  /// when there is one.
+  ///
+  /// A Tailwind class string — the same shape the static slides used.
+  gradient String @default("bg-[linear-gradient(135deg,#fdf2f8_0%,#fce7f3_40%,#fff7fb_80%)]") @db.VarChar(255)
+
+  /// The accent colour for the slide's decorative glow.
+  glow String @default("bg-brand-400/45") @db.VarChar(120)
+
+  /// Whether the banner is shown on the storefront.
+  ///
+  /// A banner is *not* deleted when a campaign ends — it is switched off.
+  /// The audit trail needs the row to still be there to describe what
+  /// happened to it.
+  isActive Boolean @default(true)
+
+  /// The display order in the carousel. Lower comes first.
+  sortOrder Int @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("hero_banners")
+}
+
+model Product {
+  id          String @id @default(cuid())
+  name        String @db.VarChar(220)
+  description String @db.Text
+
+  /// The brand the product belongs to — "CeraVe", "Bioderma",
+  /// "La Roche-Posay".
+  ///
+  /// **Null means "unknown".** The column is nullable because a product
+  /// can genuinely have no brand, and because a nullable column can be
+  /// added to a live table without a backfill that guesses. The
+  /// migration backfills only the rows whose name begins with a
+  /// *registered* brand — it never guesses.
+  ///
+  /// The column is **not** a foreign key. A `Brand` table would mean a
+  /// second admin CRUD, a join on every product read, and a migration
+  /// rewriting every seeded row — for a label with a closed, known
+  /// vocabulary. The admin form's brand picker offers the registered
+  /// brands and lets an admin type a new one; the server validates
+  /// against the same vocabulary, so the column and the vocabulary
+  /// cannot drift.
+  ///
+  /// The brand is **additional metadata**: `name` still carries the
+  /// brand prefix ("CeraVe Hydrating Facial Cleanser"). The name feeds
+  /// the image alt text, the `OrderItem.productName` snapshot, the
+  /// search term and the delete confirmation — so it is left intact.
+  brand String? @db.VarChar(80)
+
+  categoryId String
+  category   Category @relation(fields: [categoryId], references: [id], onDelete: Restrict)
 
   /// Price in poisha (1 BDT = 100 poisha).
-  pricePaisa        Int
+  pricePaisa         Int
   /// Discounted price in poisha. Null when the product is not discounted.
   discountPricePaisa Int?
   /// Convenience mirror of the discount for badge rendering. Null = no discount.
   discountPercentage Int?
+
+  /// ── The cost side of the ledger ──────────────────────────────────────
+  ///
+  /// `purchasePricePaisa` is what the shop **paid** for one unit, and
+  /// `sellingPricePaisa` is what it **charges**. Both are integer poisha,
+  /// for the same reason every other money column in this schema is:
+  /// binary floating point cannot represent a decimal amount exactly,
+  /// and a profit figure that drifts by a paisa per unit is a profit
+  /// figure nobody can reconcile against a supplier invoice.
+  ///
+  /// **Why both are nullable.** A product the shop has not yet bought
+  /// has no purchase price — it is a product the owner is considering
+  /// stocking, or one that arrived before the cost was recorded. `NULL`
+  /// means "not known", which is a truthful value, and a non-null default
+  /// of `0` would be a lie: it would say the product cost nothing, and
+  /// a margin computed against it would report a 100% profit on a
+  /// product the shop paid real money for.
+  ///
+  /// **Why `sellingPricePaisa` is separate from `pricePaisa`.** The
+  /// selling price is what the customer is actually charged today, which
+  /// is the *discounted* price when the product is on sale. `pricePaisa`
+  /// is the list price and `discountPricePaisa` is the sale price; this
+  /// column records the number that the margin arithmetic should use.
+  ///
+  /// The margin on a unit is then:
+  ///
+  /// ```text
+  /// (sellingPricePaisa - purchasePricePaisa - discountAmountPaisa) × quantity
+  /// ```
+  ///
+  /// A product with no recorded cost is **excluded** from the profit
+  /// figures rather than counted at zero cost — see
+  /// `src/lib/admin/profit.ts`.
+  purchasePricePaisa Int?
+  sellingPricePaisa  Int?
+
+  /// How many units of this product have been **sold**.
+  ///
+  /// ── Why this is a stored counter and not a count ─────────────────────
+  ///
+  /// The obvious alternative is `COUNT(order_items)` joined on the
+  /// product, which would give the same number. But the inventory list
+  /// needs that number for *every* product on the page, and a per-product
+  /// count is a per-product query — a page of twenty products would be
+  /// twenty queries, or one grouped aggregate that scans the whole
+  /// order history on every page load.
+  ///
+  /// So the counter is maintained at the point of sale, where the
+  /// quantity is already in hand. It is incremented when an order is
+  /// placed, and **decremented when the order is cancelled** — an
+  /// order that was cancelled was not a sale, and leaving the counter
+  /// inflated would report a unit sold that the customer never bought.
+  ///
+  /// The counter is a **convenience figure**, not an accounting record.
+  /// The authoritative number of units sold is always the sum of the
+  /// order items, and the profit figures are computed from the order
+  /// items rather than from this column — so a counter that drifted
+  /// would misreport a popularity ranking but could never misreport the
+  /// shop's money.
+  soldCount Int @default(0)
 
   stockQuantity Int @default(0)
 
@@ -135,7 +707,7 @@ model Product {
   /// Json + @db.JsonB: the PostgreSQL `jsonb` column type. Must be Jsonb
   /// (not plain `json`) so it remains filterable in .where() — a plain
   /// `json` column cannot be compared at all.
-  ingredients Json @db.JsonB @default("{}")
+  ingredients Json @default("{}") @db.JsonB
 
   /// Canonical ingredient IDs (AHA, BHA, RETINOL, VITAMIN_C, ...) used by the
   /// deterministic conflict engine. Populated by admin from the static
@@ -149,20 +721,83 @@ model Product {
   /// Storage adapter keys — NOT raw URLs, so the driver can be swapped.
   images String[] @default([])
 
-  isNewArrival  Boolean @default(false)
-  isBestSeller  Boolean @default(false)
+  /// Promotional badges — the closed set of known badges ("New Arrival",
+  /// "Best Seller", "Discount Offer", "Limited Edition") plus any
+  /// free-text custom tag the shop needs for a one-off campaign.
+  ///
+  /// The list is the **single source of truth** for the promotional
+  /// labels on a product. `isNewArrival` and `isBestSeller` below are
+  /// a *mirror* of two entries in this list, maintained by the admin
+  /// catalogue service on every write — the storefront reads the
+  /// booleans, so it does not have to know about the badge list.
+  ///
+  /// A scalar list cannot carry a `@@index` in PostgreSQL, so this is
+  /// deliberately not indexed. The catalogue filters on the booleans,
+  /// which are indexed.
+  badges String[] @default([])
+
+  /// The skin concerns this product addresses — "acne", "dryness".
+  ///
+  /// The slugs of the `SkinConcern` rows the product belongs to. They
+  /// are the **discovery** axis: the ingredient tags answer "what is in
+  /// it", and these answer "what is it for".
+  ///
+  /// The column is a plain list of slugs rather than a join table, for
+  /// the same reason `brand` is a plain string (DECISIONS.md #16): the
+  /// vocabulary is small, admin-managed, and read on its own. A join
+  /// table would add a second admin CRUD and a join on every catalogue
+  /// read for a list of labels.
+  ///
+  /// A slug is stored rather than an id so the value stays meaningful
+  /// after a concern is renamed — a rename changes the name and the
+  /// description, never the slug.
+  ///
+  /// The server checks each slug against the `SkinConcern` table on the
+  /// way in, so a product cannot carry a concern the shop does not
+  /// have. A scalar list cannot carry a `@@index` in PostgreSQL, so
+  /// this is deliberately not indexed.
+  concernSlugs String[] @default([])
+
+  isNewArrival Boolean @default(false)
+  isBestSeller Boolean @default(false)
+
+  /// When the product was withdrawn from the storefront.
+  ///
+  /// Archiving is the default "delete" for a product, and it exists
+  /// because a hard delete is usually impossible: `OrderItem.productId`
+  /// is `onDelete: Restrict`, and the order line snapshots the product's
+  /// name and price *precisely so that history survives*. A product that
+  /// has ever been ordered cannot be deleted from the database without
+  /// destroying the record of that sale.
+  ///
+  /// A product with `archivedAt` set must not appear in any
+  /// customer-facing query. The filter is one shared constant —
+  /// `ACTIVE_PRODUCT_WHERE` in `src/lib/catalog/product-visibility.ts` —
+  /// and forgetting it would **sell an archived product**, so the
+  /// storefront's ten query sites are all checked against it.
+  ///
+  /// Null means "on sale". The default is therefore the safe one: a
+  /// product that nobody has thought about is visible.
+  archivedAt DateTime?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  reviews   Review[]
+  reviews    Review[]
   orderItems OrderItem[]
-  cartItems CartItem[]
+  cartItems  CartItem[]
 
   @@index([categoryId])
   @@index([isNewArrival])
   @@index([isBestSeller])
   @@index([createdAt])
+  @@index([archivedAt])
+  /// The brand is filtered on the storefront's brand facet and by the
+  /// catalogue's brand search, so it is indexed.
+  @@index([brand])
+  /// The inventory screen sorts by "best selling", so the counter is
+  /// read as an ordering key.
+  @@index([soldCount])
   @@map("products")
 }
 
@@ -176,6 +811,29 @@ model Cart {
   user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  /// The coupon code the customer has applied to this cart.
+  ///
+  /// **Uppercase**, because the coupon service normalises the code on
+  /// the way in — "eid2026" and "EID2026" are one coupon, and the
+  /// `Coupon.code` unique constraint is what makes that safe.
+  ///
+  /// It is stored as the **code** rather than the coupon's id, because
+  /// the code is what the customer was shown and what the shop's
+  /// marketing refers to. The order records the same string, so an
+  /// order can be traced back to the campaign without a join.
+  ///
+  /// **Null means no coupon.** It is not a foreign key, and it is not
+  /// validated by the database: the code is checked against the
+  /// `Coupon` table when it is applied, and it is checked again when
+  /// the order is placed. A coupon that expires between the two is
+  /// refused at the checkout rather than silently ignored.
+  ///
+  /// The cart carries the code rather than the computed discount,
+  /// because the discount depends on the cart's contents — which can
+  /// change after the code is applied. The amount is always computed
+  /// from the lines at the moment it is shown or charged.
+  couponCode String? @db.VarChar(40)
 
   items CartItem[]
 
@@ -201,28 +859,262 @@ model CartItem {
 // ─────────────────────────────────────────────────────────────────────────────
 
 model Order {
-  id        String      @id @default(cuid())
-  userId    String
-  user      User        @relation(fields: [userId], references: [id], onDelete: Restrict)
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  /// Human-readable reference, e.g. "EGB-20261027-A1B2C3".
+  /// For customers to quote over the phone. NOT the primary key — `id`
+  /// remains the identity. @unique so it can be looked up directly.
+  orderNumber String @unique @db.VarChar(40)
 
   /// Totals in poisha.
+  /// subtotalPaisa is the sum of the line totals, before shipping.
+  /// totalAmountPaisa is what the customer pays.
+  subtotalPaisa       Int
   totalAmountPaisa    Int
   shippingAmountPaisa Int @default(0)
+
+  /// The **total** discount applied to the order, in poisha.
+  ///
+  /// It is the sum of the free-shipping discount and the coupon
+  /// discount — that is, the total the customer **saved**. It is *not*
+  /// a deduction from the total, because the free-shipping half of it
+  /// is already reflected in `shippingAmountPaisa`, which is the charge
+  /// the customer actually pays for delivery.
+  ///
+  /// So the invariant for the amount charged is:
+  ///
+  /// ```text
+  /// totalAmountPaisa = subtotalPaisa + shippingAmountPaisa - couponDiscountPaisa
+  /// ```
+  ///
+  /// and `discountAmountPaisa` is what the screens report as the
+  /// saving. One column for the total, rather than one per kind of
+  /// discount, because the customer is charged one number and the
+  /// screens that show it must show **that** number. Two columns would
+  /// mean every reader had to remember to add them.
   discountAmountPaisa Int @default(0)
 
+  /// The coupon the customer redeemed, in poisha.
+  ///
+  /// **The coupon's share of `discountAmountPaisa`**, not the whole of
+  /// it. The remainder is the free-shipping discount, which is a
+  /// property of the order's value rather than of a promotion.
+  ///
+  /// Zero on an order with no coupon. It is separate from
+  /// `discountAmountPaisa` so the admin can answer "how much did this
+  /// campaign actually give away?" without re-deriving the shipping
+  /// rule.
+  couponDiscountPaisa Int @default(0)
+
+  /// The coupon code the customer redeemed, or `null`.
+  ///
+  /// **The code, not the coupon's id.** The code is what the customer
+  /// was shown, what the shop's marketing refers to, and what the
+  /// customer will quote if they ask about the price they paid. It is
+  /// the same uppercase string the cart held, so the trail from "the
+  /// code they typed" to "the order it discounted" is one string, not
+  /// a join.
+  ///
+  /// The coupon row itself is never deleted — it is deactivated, which
+  /// preserves the campaign's redemption history — so a code recorded
+  /// here always refers to a coupon that existed.
+  couponCode String? @db.VarChar(40)
+
   shippingAddress Json
-  status          OrderStatus    @default(PENDING)
-  paymentMethod   PaymentMethod  @default(COD)
-  paymentStatus   PaymentStatus  @default(PENDING)
+
+  /// Where the ORDER is in the fulfilment pipeline:
+  /// PENDING -> PROCESSING -> SHIPPED -> DELIVERED (or CANCELLED).
+  status OrderStatus @default(PENDING)
+
+  /// The payment method the customer chose. COD is the default.
+  ///
+  /// The enum carries four values because they are four different
+  /// *settlement* paths, not four different buttons:
+  ///
+  ///   • `COD`   — cash collected by the courier on delivery.
+  ///   • `BKASH` — a bKash mobile-banking transfer.
+  ///   • `NAGAD` — a Nagad mobile-banking transfer.
+  ///   • `CARD`  — an online card payment.
+  ///
+  /// bKash and Nagad are separate values rather than one "MOBILE"
+  /// value because the shop **settles each transfer against a specific
+  /// operator's account**. A single combined value would leave the
+  /// admin unable to tell whose wallet to check, which is the one thing
+  /// the column has to answer.
+  paymentMethod PaymentMethod @default(COD)
+
+  /// The transaction ID the customer sent the payment from — the TrxID
+  /// bKash and Nagad show in their confirmation screen.
+  ///
+  /// Null for `COD` and `CARD`, which have no customer-side reference.
+  /// It is the admin's handle on the money: without it, an advance
+  /// payment cannot be matched to the order.
+  paymentTransactionId String? @db.VarChar(64)
+
+  /// The mobile number the transfer was sent FROM — the "sender number"
+  /// bKash and Nagad display.
+  ///
+  /// Null for `COD` and `CARD`. It is not the delivery phone number:
+  /// those are frequently different, and it is the sender's number that
+  /// appears in the operator's statement.
+  paymentSenderNumber String? @db.VarChar(20)
+
+  /// Where the MONEY is. Deliberately separate from `status`: a COD order
+  /// can be SHIPPED while the payment is still PENDING, because the cash
+  /// is collected on delivery.
+  paymentStatus PaymentStatus @default(PENDING)
+
+  /// The one-time token that authorises a gateway settle on this order.
+  ///
+  /// It is a bearer token: the browser holds it, and the settle endpoint
+  /// requires it alongside the session cookie. It is NOT a password and
+  /// NOT a secret that must survive a database leak — it authorises
+  /// exactly one transition on exactly one order, and only while that
+  /// order's payment is still PENDING.
+  ///
+  /// It is stored in the **clear**, not hashed, and that is deliberate. A
+  /// hash is only useful when the plaintext must be re-transmitted on
+  /// every use and never needs to be recoverable — the password case,
+  /// which is exactly what `users.passwordHash` does with bcrypt. This
+  /// token is used exactly once: the settle endpoint consumes it and
+  /// clears this column in the same transaction that marks the order
+  /// PAID. There is no second use, so there is no stored credential to
+  /// attack offline.
+  ///
+  /// The security comes from three things instead: unguessability (128
+  /// bits from `crypto.randomUUID`), one-shot use, and the
+  /// customer-scoped ownership check in the settle endpoint — the token
+  /// alone is not enough, the caller must also own the order.
+  ///
+  /// NULL for a COD order, and NULL after the payment is settled.
+  paymentGatewaySessionId String? @unique @db.VarChar(64)
+
+  /// The gateway's own transaction reference, recorded when a gateway
+  /// payment succeeds.
+  ///
+  /// Separate from `paymentTransactionId`, which is the *customer's*
+  /// transfer reference for mobile banking. The gateway issues its own
+  /// reference, and conflating the two would put a server-minted value
+  /// in a column whose comment says "the transaction ID the customer
+  /// sent the payment from" — and would break the rule that a card
+  /// order carries no customer-side reference.
+  ///
+  /// For a bKash or Nagad order BOTH columns are populated: the
+  /// customer's TrxID in `paymentTransactionId`, the gateway's
+  /// reference here.
+  paymentGatewayTransactionId String? @db.VarChar(64)
+
+  /// The SSLCOMMERZ session key for this order's gateway session.
+  ///
+  /// SSLCOMMERZ hands back a `sessionkey` when it opens a session, and
+  /// that key is what its own validation endpoint accepts. So this is
+  /// the one handle that lets the shop ask the gateway "was this
+  /// transaction really paid?" — which is the only way a callback can
+  /// be trusted, because the callback URL is reachable by anyone who
+  /// can edit a query string.
+  ///
+  /// NULL for an order that never opened an SSLCOMMERZ session (every
+  /// COD order, and every order settled through the shop's own
+  /// simulated gateway).
+  paymentGatewaySessionKey String? @db.VarChar(64)
+
+  /// The gateway's validation handle (`val_id`) for this order.
+  ///
+  /// Sent by SSLCOMMERZ on the success callback, and the handle its
+  /// validation API takes. Recording it means a replayed or duplicated
+  /// callback can be checked against the same record rather than
+  /// against a freshly-opened session.
+  ///
+  /// NULL until the gateway sends it.
+  paymentGatewayValidationId String? @db.VarChar(64)
+
+  /// The bank's own transaction reference for the settled payment.
+  ///
+  /// SSLCOMMERZ reports this as `bank_tran_id` — the reference that
+  /// appears on the customer's card statement and in the gateway's
+  /// own settlement report. It is a **different** number from
+  /// `paymentGatewayTransactionId` (which is the shop's own mint) and
+  /// a different number from `paymentTransactionId` (which is the
+  /// customer's mobile-banking TrxID).
+  ///
+  /// Three transaction references on one row is not redundancy: they
+  /// answer three different questions — "which of our payments is
+  /// this?", "which card statement line is this?", and "which transfer
+  /// did the customer send?".
+  paymentGatewayBankTransactionId String? @db.VarChar(64)
+
+  /// The amount the gateway recorded, in taka.
+  ///
+  /// Written on a validated success so the shop can compare the
+  /// gateway's figure against the order's own total. A mismatch is a
+  /// refund case, and it is only detectable if the gateway's number
+  /// was stored.
+  paymentGatewayAmountTaka Int?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  items OrderItem[]
+  items           OrderItem[]
+  paymentAttempts PaymentAttempt[]
 
   @@index([userId, createdAt])
   @@index([status])
+  @@index([paymentStatus])
   @@map("orders")
+}
+
+/// One attempt to pay for an order through the payment gateway.
+///
+/// An order can be attempted many times: the customer opens the sandbox
+/// window, the payment fails, they try again. The *current* state of the
+/// payment is one value — it lives on `orders.paymentStatus`. The
+/// *history* of the attempts is many rows, and a row of history does not
+/// fit in a column.
+///
+/// ── Why a failed attempt does not set `paymentStatus` to FAILED ─────────
+///
+/// The tempting design is to write `FAILED` on the order when a payment
+/// attempt fails, and let the customer retry from `FAILED`. That
+/// contradicts two existing rules:
+///
+///   1. `PAYMENT_STATUS_TRANSITIONS` treats `FAILED` as terminal. Retrying
+///      from `FAILED` would need a `FAILED -> PENDING` path that exists
+///      nowhere else, and a special case in a closed table is a bug
+///      factory.
+///
+///   2. Restoring the reserved stock on failure and then letting the
+///      customer retry the SAME order would oversell. The restoration in
+///      `changeOrderStatus` is guarded by the order's status transition
+///      — there is no separate "already restored" flag — so a
+///      failure-then-retry sequence either restores the stock twice or
+///      restores it and retries without re-reserving it.
+///
+/// So a failed attempt leaves `orders.paymentStatus` at PENDING and
+/// leaves the reservation intact. The order is still live; the money is
+/// still unresolved; the customer retries with one click. The failure is
+/// recorded here, as an attempt, which is what it actually is.
+model PaymentAttempt {
+  id String @id @default(cuid())
+
+  /// The order the attempt was made against.
+  orderId String
+  order   Order  @relation(fields: [orderId], references: [id], onDelete: Restrict)
+
+  /// Whether the (simulated) gateway accepted the payment.
+  outcome PaymentAttemptOutcome
+
+  /// The gateway session the attempt was made with.
+  sessionId String? @db.VarChar(64)
+
+  /// The gateway's message, when the attempt failed.
+  failureMessage String? @db.VarChar(200)
+
+  createdAt DateTime @default(now())
+
+  @@index([orderId])
+  @@map("payment_attempts")
 }
 
 model OrderItem {
@@ -236,20 +1128,250 @@ model OrderItem {
 
   /// Name and price are snapshotted so historical orders stay accurate even
   /// if the catalogue later renames the product or changes its price.
-  productName    String @db.VarChar(220)
-  pricePaisa     Int
-  quantity       Int
+  productName      String    @db.VarChar(220)
+  pricePaisa       Int
+
+  /// ── The cost and the discount, snapshotted ───────────────────────────
+  ///
+  /// These two columns are what make a **historical** profit figure
+  /// possible.
+  ///
+  /// `purchasePricePaisa` is the product's cost **at the moment of the
+  /// sale**. It is snapshotted for the same reason `pricePaisa` is: the
+  /// catalogue's cost moves — suppliers change their prices, the shop
+  /// renegotiates — and a profit figure for a sale made last quarter
+  /// must not silently change when the current supplier price does.
+  ///
+  /// Nullable, for the same reason the product's own cost column is: a
+  /// sale of a product whose cost was never recorded has no known cost,
+  /// and `NULL` is the truthful value. A line with no cost is excluded
+  /// from the profit arithmetic rather than counted at zero cost.
+  ///
+  /// `discountAmountPaisa` is the **extra** discount given away on this
+  /// line, in poisha — the coupon's share of the order, allocated to the
+  /// line.
+  ///
+  /// It is a snapshot rather than a derivation because a line's discount
+  /// can come from more than the product's own `discountPricePaisa`: a
+  /// coupon is applied to the order as a whole, and splitting that
+  /// coupon across the lines is an allocation rule, not a fact about
+  /// the product. The number recorded here is the discount that was
+  /// actually applied to this line at the moment the order was placed.
+  ///
+  /// The product's **own** discount is not repeated here, because
+  /// `pricePaisa` above is already the price the customer paid — that
+  /// is, it is already net of the product's `discountPricePaisa`. So
+  /// this column carries only the discount that came from *above* the
+  /// product: the coupon.
+  ///
+  /// Zero means "no coupon was applied to this line" — which is the
+  /// ordinary case, and is not the same as "unknown".
+  ///
+  /// The margin arithmetic is therefore:
+  ///
+  /// ```text
+  /// profit = (pricePaisa - purchasePricePaisa - discountAmountPaisa) × quantity
+  /// ```
+  ///
+  /// where `pricePaisa` is the selling price the customer actually paid
+  /// per unit.
+  purchasePricePaisa  Int?
+  discountAmountPaisa Int @default(0)
+
+  quantity         Int
   /// User-supplied estimate of when the product runs out. Never inferred.
   estimatedEmptyAt DateTime?
   /// Set when the expiry reminder SMS has been sent for this line.
-  reminderSentAt DateTime?
+  reminderSentAt   DateTime?
 
   createdAt DateTime @default(now())
 
   @@index([orderId])
   @@index([productId])
   @@index([estimatedEmptyAt])
+  /// The sweep filters on `estimatedEmptyAt` AND `reminderSentAt IS NULL`,
+  /// so both columns are worth an index.
+  @@index([reminderSentAt])
+  /// The profit queries filter on lines that have a recorded cost, and the
+  /// column is nullable precisely so that "has a cost" is a cheap
+  /// predicate rather than a scan.
+  @@index([purchasePricePaisa])
   @@map("order_items")
+}
+
+/// One attempt to track an order without an account.
+///
+/// ── Why this table exists ─────────────────────────────────────────────────
+/// The guest order-tracking endpoint is **public** — anyone may call it,
+/// signed in or not — and it answers one question: *what is the state of
+/// this order?*
+///
+/// The protection is the **contact detail** the customer supplies: the
+/// email address or the phone number on the order. That is a secret the
+/// customer holds and an attacker does not, and it is what stops the
+/// endpoint from being an oracle over the shop's order numbers.
+///
+/// A limit turns "hard to guess" into "expensive to guess". So the
+/// endpoint counts its attempts, and this table is where the count
+/// comes from.
+///
+/// ── Why the count is in the database, not in memory ──────────────────────
+/// A process-local counter is reset on every restart and is not shared
+/// between instances — which is exactly when a cap is needed. The
+/// advisor's hourly message limit is counted the same way, for the same
+/// reason.
+///
+/// ── Why the row records the order number and nothing else ────────────────
+/// The order number is not a secret: it is printed on a parcel, quoted
+/// over the phone and pasted into a chat window. What the row must not
+/// hold is the **contact detail** — that is the secret, and a table of
+/// customer emails and phone numbers is a liability rather than a
+/// feature. So the row records the number that was looked up, whether
+/// the attempt succeeded, and when.
+///
+/// ── Why only failed attempts are counted ─────────────────────────────────
+/// A successful attempt has already proved the caller knows the contact
+/// detail, so it is not an attempt at guessing. Counting it would mean a
+/// customer who checks their order five times in an hour — which is
+/// ordinary, and is the whole point of the page — eventually locks
+/// themselves out of their own order.
+///
+/// So the cap counts **failures**. Brute force is what the cap exists to
+/// stop, and a success is not brute force.
+///
+/// ── Why a failure against a number that does not exist is still recorded ──
+/// This is the subtle one, and it is the reason the row carries the order
+/// number even when no order matched.
+///
+/// The endpoint answers **identically** for a mistyped order number, a
+/// number that was never issued, and a correct number with a wrong
+/// contact detail. If the counter only moved for numbers that *exist*,
+/// the limit itself would become an oracle: an attacker could grind a
+/// candidate number until it started answering `RATE_LIMITED`, and that
+/// answer would tell them the number is real.
+///
+/// So every failed attempt is recorded against the number that was
+/// tried, whether or not that number belongs to an order. The counter
+/// then moves identically in all three cases, and the limit leaks
+/// nothing.
+model OrderTrackingAttempt {
+  id String @id @default(cuid())
+
+  /// The order number that was looked up, in the shop's canonical form.
+  ///
+  /// A well-formed number only: an input that is not shaped like an
+  /// order number is refused by the validation layer before any lookup
+  /// happens, so it never reaches this table.
+  orderNumber String @db.VarChar(40)
+
+  /// Whether the attempt matched the order.
+  ///
+  /// Only the failures are counted against the hourly limit, so this
+  /// column is what makes the count mean "guesses" rather than "lookups".
+  succeeded Boolean @default(false)
+
+  createdAt DateTime @default(now())
+
+  /// The limit query is "how many failures for this order number since
+  /// an hour ago", so the two columns are indexed together.
+  @@index([orderNumber, createdAt])
+  /// The rows are pruned by age, so the age is worth its own index.
+  @@index([createdAt])
+  @@map("order_tracking_attempts")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Coupons — discount codes
+//
+// ── Why the terms are stored as data, not as code ─────────────────────────
+//
+// A coupon is a **commercial decision with a monetary value**. "Twenty
+// percent off" is not a feature; it is a price reduction that changes
+// what the customer pays. So the terms live in columns an admin can set
+// and an audit entry can record, rather than in a hard-coded rule set.
+//
+// ── Why `PERCENTAGE` and `FIXED` are separate columns, not one `value` ─────
+//
+// A percentage and a fixed amount are different *kinds* of number. A
+// single `value` column would make "20" mean 20% in one row and ৳20 in
+// another, and the reader would have to know which. Two columns, one of
+// which is always null, cannot be misread.
+//
+// ── Why `value` is in poisha for a fixed discount ─────────────────────────
+//
+// Money is integer poisha everywhere in this codebase (1 BDT = 100
+// poisha). A float taka amount would introduce a second unit into a
+// system that has exactly one, and the rounding would not be ours.
+//
+// ── Why `usageLimit` is nullable ───────────────────────────────────────────
+//
+// Null means "no limit". Zero would mean "nobody may use this", which
+// is a different thing, and an accidental zero would silently kill a
+// campaign.
+
+model Coupon {
+  id String @id @default(cuid())
+
+  /// The code the customer types, e.g. "EID2026".
+  ///
+  /// Stored **uppercase** — the service normalises it on the way in, so
+  /// "eid2026" and "EID2026" are the same coupon rather than two. The
+  /// unique constraint is what makes that safe.
+  code String @unique @db.VarChar(40)
+
+  /// A human description of what the coupon is for, e.g. "Eid campaign".
+  /// Shown only in the admin panel.
+  description String? @db.VarChar(200)
+
+  /// How the discount is calculated.
+  discountType CouponDiscountType
+
+  /// The discount, as a whole-number percentage (1–100).
+  ///
+  /// Set only when `discountType` is `PERCENTAGE`. Null otherwise.
+  percentOff Int?
+
+  /// The discount, in whole poisha.
+  ///
+  /// Set only when `discountType` is `FIXED`. Null otherwise.
+  amountOffPaisa Int?
+
+  /// When the coupon stops working.
+  ///
+  /// A code with no expiry is a permanent commitment to a discount, which
+  /// is why `expiresAt` is required rather than optional. The service
+  /// refuses to create one in the past.
+  expiresAt DateTime
+
+  /// How many times the coupon may be used in total.
+  ///
+  /// Null means "no limit". Zero would mean "nobody may use this".
+  usageLimit Int?
+
+  /// How many times the coupon has been used.
+  usageCount Int @default(0)
+
+  /// Whether the coupon is currently redeemable.
+  ///
+  /// Distinct from "expired": an expired coupon is inactive *by the
+  /// passage of time*, while a deactivated one was switched off by an
+  /// admin. The audit trail records the second, not the first.
+  isActive Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([isActive, expiresAt])
+  @@index([createdAt(sort: Desc)])
+  @@map("coupons")
+}
+
+/// How a coupon's discount is calculated.
+enum CouponDiscountType {
+  /// A percentage off the subtotal.
+  PERCENTAGE
+  /// A fixed amount off the subtotal, in poisha.
+  FIXED
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -264,18 +1386,170 @@ model Review {
   user      User    @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   rating  Int
-  comment String  @db.Text
+  comment String @db.Text
 
   /// Storage adapter key for an unboxing / review clip. Null for text-only.
   videoUrl String? @db.VarChar(300)
 
-  isApproved Boolean  @default(false)
-  createdAt  DateTime @default(now())
-  updatedAt  DateTime @updatedAt
+  /// Whether the review is published.
+  isApproved Boolean @default(false)
+
+  /// Set when an admin withdraws a published review.
+  ///
+  /// Distinct from `isApproved`: a hidden review WAS approved once, and
+  /// that history must not be lost. `isApproved` alone cannot tell a
+  /// hidden review from a pending one — both read as "not public".
+  ///
+  /// The *who* and the *why* of the moderation live in `AdminAuditLog`,
+  /// not here. This row carries only the current state.
+  isHidden Boolean @default(false)
+
+  /// When the review was last moderated. Null while it is still pending.
+  moderatedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   @@index([productId, isApproved])
+  @@index([isApproved, isHidden])
   @@index([userId])
   @@map("reviews")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Admin audit log — one general table, not per-entity columns.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Every privileged action the platform takes, recorded.
+///
+/// ── Why one table and not columns on each entity ───────────────────────
+///
+/// A review can be approved, then hidden, then approved again. Columns
+/// like `approvedBy` / `hiddenBy` / `approvedAt` / `hiddenAt` on the
+/// `reviews` table would destroy the earlier decisions — each write
+/// overwrites the last, and the shop can no longer answer "who hid this,
+/// and why".
+///
+/// The *history* of those decisions is the thing that has to survive, so
+/// the history is the table. One row per decision, appended, never
+/// updated.
+///
+/// ── Why the audit write is part of the mutation's transaction ──────────
+///
+/// A mutation without an audit trail is worse than no audit trail at all,
+/// because it looks complete. The service layer writes both in one
+/// transaction, so either the change and its audit entry both land, or
+/// neither does.
+model AdminAuditLog {
+  id String @id @default(cuid())
+
+  /// The admin who performed the action.
+  ///
+  /// SetNull, not Restrict: the audit trail must outlive the account.
+  /// A deleted admin's decisions still need to be explainable.
+  actorId String?
+  actor   User?   @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  /// The actor's name and email, copied at the time of the action.
+  ///
+  /// Denormalised on purpose: when `actorId` is nulled by a deletion, the
+  /// entry still names a human rather than pointing at nothing.
+  actorName  String @db.VarChar(160)
+  actorEmail String @db.VarChar(255)
+
+  /// What was done.
+  action AdminAction
+
+  /// The kind of thing acted upon — "review", "order", "order_item".
+  entityType String @db.VarChar(40)
+  /// The id of the thing acted upon.
+  entityId   String @db.VarChar(64)
+
+  /// The state before and after the action.
+  ///
+  /// Jsonb, because an admin may filter the trail on it. Only status
+  /// flags and order statuses are ever stored here — never a shipping
+  /// address, never a price, never a phone number.
+  before Json? @db.JsonB
+  after  Json? @db.JsonB
+
+  /// A free-text reason, for the actions that need one (hiding a review).
+  reason String? @db.VarChar(500)
+
+  createdAt DateTime @default(now())
+
+  @@index([actorId, createdAt(sort: Desc)])
+  @@index([entityType, entityId, createdAt(sort: Desc)])
+  @@index([action, createdAt(sort: Desc)])
+  @@map("admin_audit_logs")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Admin notifications — the order desk's inbox
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The kind of thing an admin is being told about.
+///
+/// A closed enum rather than a free string, because the bell renders
+/// an icon and a sentence per kind. A free string would put that
+/// mapping in a component, where a new value silently renders as
+/// nothing.
+enum AdminNotificationKind {
+  /// A customer placed a new order.
+  ORDER_PLACED
+  /// A customer's payment was settled through the gateway.
+  PAYMENT_SETTLED
+  /// A payment attempt was declined.
+  PAYMENT_FAILED
+}
+
+model AdminNotification {
+  id String @id @default(cuid())
+
+  /// What the admin is being told about.
+  kind AdminNotificationKind
+
+  /// The id of the thing acted upon — the order.
+  ///
+  /// A plain string rather than a foreign key, for the same reason the
+  /// audit log's `entityId` is: a notification must survive the order
+  /// it refers to. An order deleted by a customer support request
+  /// would otherwise cascade-delete the record that it happened.
+  entityId String @db.VarChar(64)
+
+  /// The order's human-readable number, copied at the time.
+  ///
+  /// Denormalised for the same reason as the audit log's actor name:
+  /// the bell shows "EGB-20261030-A1B2C3" without a second query per
+  /// notification, and the reference survives the order.
+  orderNumber String @db.VarChar(40)
+
+  /// The customer's name, copied at the time.
+  customerName String @db.VarChar(160)
+
+  /// The order total in poisha, copied at the time.
+  ///
+  /// Copied so the toast can say "৳2,400" without reading the order.
+  /// A notification about a ৳2,400 order is not the same signal as one
+  /// about a ৳24,000 order, and the admin should be able to tell them
+  /// apart at a glance.
+  totalAmountPaisa Int
+
+  /// The payment method the customer chose.
+  paymentMethod PaymentMethod
+
+  /// Whether the admin has seen it.
+  ///
+  /// A boolean rather than a `readAt` timestamp, because the badge
+  /// counts **unread**, and a timestamp would only be needed for
+  /// "seen at 14:32" — which the audit log already answers, better.
+  read Boolean @default(false)
+
+  createdAt DateTime @default(now())
+
+  @@index([read, createdAt(sort: Desc)])
+  @@index([entityId])
+  @@map("admin_notifications")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -305,7 +1579,7 @@ model AdvisorMessage {
   conversation   AdvisorConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
 
   role    MessageRole
-  content String          @db.Text
+  content String      @db.Text
 
   /// Which provider/model produced this message, for auditability.
   provider String? @db.VarChar(40)
@@ -368,14 +1642,14 @@ model UserSkinProfile {
   user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   skinType SkinType?
-  concerns String[] @default([])
+  concerns String[]  @default([])
 
   /// A photo the user explicitly consented to keep.
   /// @unique: makes this a true one-to-one — one profile photo per profile.
   /// Without it, two profiles could point at the same image.
-  profileImageId String? @unique
+  profileImageId String?       @unique
   /// SetNull: deleting the photo must NOT delete the profile.
-  profileImage AdvisorImage? @relation(fields: [profileImageId], references: [id], onDelete: SetNull)
+  profileImage   AdvisorImage? @relation(fields: [profileImageId], references: [id], onDelete: SetNull)
 
   notes String? @db.Text
 
@@ -383,11 +1657,30 @@ model UserSkinProfile {
   estimatedEmptyAt DateTime?
 
   /// Explicit SMS consent for the expiry reminder (locked decision #9).
+  ///
+  /// ── NOT the flag the reminder workflow reads ─────────────────────────
+  ///
+  /// The depletion-reminder workflow is authorised by `User.smsOptIn` and
+  /// by nothing else. This field belongs to the skin-profile feature and
+  /// is deliberately NOT consulted by that workflow.
+  ///
+  /// The reason, because it is a subtle one and the change looks like a
+  /// security improvement while being a bug: this field defaults to
+  /// `false`, and **a default is not a decision**. A customer who opted
+  /// in at registration and later created a skin profile would silently
+  /// stop receiving reminders — not because they refused, but because a
+  /// feature they happened to use has an unrelated checkbox that was
+  /// never asked.
+  ///
+  /// If a future step wants per-feature consent, it introduces it
+  /// deliberately: with a migration, a real UI, and a tri-state
+  /// (`null` = not asked, `true` = yes, `false` = no) rather than a
+  /// boolean that cannot tell "no" from "never asked".
   smsOptIn Boolean @default(false)
 
   lastAnalysisDate DateTime?
-  createdAt        DateTime @default(now())
-  updatedAt        DateTime @updatedAt
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
 
   @@map("user_skin_profiles")
 }
@@ -425,25 +1718,205 @@ model AiConfig {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Site settings — admin controlled
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The shop's own settings, as opposed to the catalogue's contents.
+///
+/// A single-row table guarded in the service layer, exactly like
+/// `AiConfig`. The `key` column is always "default".
+///
+/// It is a **separate model** rather than more columns on `AiConfig`
+/// because the two answer different questions and have different
+/// lifecycles. `AiConfig` is the advisor's *compliance and behaviour*
+/// configuration — it is compliance text, it is versioned, and it is
+/// written on a schedule. `SiteSettings` is the shop's *presentation*
+/// configuration — what the storefront says and whether it says it.
+///
+/// The marquee is the first of them. It is a line of marketing copy on
+/// every page, so it is a commercial surface and it is audited like one.
+model SiteSettings {
+  id  String @id @default(cuid())
+  /// Single-row table guarded in the service layer. Always "default".
+  key String @unique @db.VarChar(40)
+
+  /// Whether the announcement marquee is shown on the storefront.
+  ///
+  /// This is a **switch**, not a value: the marquee is either on the
+  /// page or it is not. There is no in-between, and no "on but empty" —
+  /// an empty marquee is a strip of coloured nothing, which is why the
+  /// admin route refuses to save empty text while the switch is on.
+  isMarqueeEnabled Boolean @default(false)
+
+  /// The marquee's copy — the words that scroll.
+  ///
+  /// Kept even while the switch is off, so that switching it back on
+  /// restores the message the admin wrote rather than losing it.
+  marqueeText String @default("") @db.VarChar(240)
+
+  /// Where the marquee links to, when it links anywhere.
+  ///
+  /// A **path within the storefront**, or nothing. The same closed rule
+  /// the hero banner's calls to action follow: an announcement that
+  /// could point at another host would be a way to take the storefront
+  /// over from the shop that owns it.
+  marqueeHref String? @db.VarChar(255)
+
+  /// The marquee's background colour.
+  ///
+  /// A **hex triplet**, stored as the admin typed it — not a token name.
+  /// The bar's ground is a deliberate, per-announcement choice: a
+  /// campaign can be ink for a quiet week and rose for a launch, and a
+  /// token name could only offer the shop the colours the design system
+  /// already had.
+  ///
+  /// The default is the shop's darkest fill (`#1c1917`), which is the
+  /// colour the bar carried before the admin could change it — so a
+  /// fresh row looks exactly like the bar the shop is used to.
+  marqueeBgColor String @default("#1c1917") @db.VarChar(7)
+
+  /// The marquee's text colour.
+  ///
+  /// A **hex triplet**, for the same reason as the background. It
+  /// defaults to white, which is what white-on-ink needs.
+  ///
+  /// The two colours are stored **independently** rather than as a
+  /// theme name, because the pair is the shop's to choose and the
+  /// validation layer is what checks that the result is legible.
+  marqueeTextColor String @default("#ffffff") @db.VarChar(7)
+
+  /// The address the shop's support desk answers at.
+  ///
+  /// Empty by default: a shop that has not told us where it is gets no
+  /// address in the footer, rather than a placeholder that looks like
+  /// a real one.
+  supportEmail String @default("") @db.VarChar(255)
+
+  /// The telephone number of the shop's support desk.
+  ///
+  /// A **display** string rather than a dialable one. The footer shows
+  /// it the way the shop writes it, and the `tel:` link is built from
+  /// the digits alone — so "01819-000000" reads well and still dials.
+  supportPhone String @default("") @db.VarChar(40)
+
+  /// When the support desk is open.
+  ///
+  /// Free text rather than a schedule, because a shop's hours are a
+  /// sentence — "Saturday to Thursday, 10am–8pm" — and a rigid
+  /// week-of-times structure could not hold it.
+  supportHours String @default("") @db.VarChar(120)
+
+  /// Where the shop's counter is.
+  ///
+  /// Free text, and possibly more than one line. A store address is an
+  /// address, and addresses are not a single field.
+  storeAddress String @default("") @db.VarChar(400)
+
+  updatedAt DateTime @updatedAt
+
+  @@map("site_settings")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // SMS log (mock gateway target)
 // ─────────────────────────────────────────────────────────────────────────────
 
 model SmsLog {
-  id     String @id @default(cuid())
-  phone  String @db.VarChar(20)
-  body   String @db.Text
+  id     String  @id @default(cuid())
+  phone  String  @db.VarChar(20)
+  body   String  @db.Text
   /// The intended recipient, for admin filtering.
   userId String? @db.VarChar(40)
 
   /// "sent" | "failed" | "queued" — the mock gateway always "sends".
-  status      String   @default("sent")
-  provider    String   @default("mock")
+  status         String  @default("sent")
+  provider       String  @default("mock")
   /// Idempotency key, so a re-run cannot double-send.
   idempotencyKey String? @unique @db.VarChar(120)
+
+  /// The provider's own reference for the message, when it has one.
+  ///
+  /// Recorded for support: it lets an admin ask the provider what
+  /// happened to a specific message.
+  providerMessageId String? @db.VarChar(120)
+
+  /// A machine-readable failure code, set when `status` is "failed".
+  errorCode String? @db.VarChar(60)
+
+  /// The order item this message concerns, for the admin log view.
+  orderItemId String? @db.VarChar(64)
+
+  /// Why the message was sent — "depletion_reminder" | "manual_resend".
+  reason String? @db.VarChar(40)
 
   createdAt DateTime @default(now())
 
   @@index([phone])
   @@index([userId])
+  /// The admin log view sorts by `createdAt` and filters by `status`.
+  @@index([createdAt(sort: Desc)])
+  @@index([status])
   @@map("sms_logs")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Traffic
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One recorded visit to the storefront.
+///
+/// ── Why this table exists ───────────────────────────────────────────────
+/// There was no traffic data anywhere in the system — no page-view table,
+/// no referrer column, no UTM capture. A traffic breakdown could only
+/// have been built by inventing the numbers, and an invented donut is
+/// worse than no donut: it looks like data.
+///
+/// So the data is collected. This table is where it lands.
+///
+/// ── Privacy ──────────────────────────────────────────────────────────────
+/// It records a **bucketed channel**, a referrer *host*, a landing path
+/// and a pseudonymous first-party visitor id. It records **no** IP
+/// address, **no** user agent, **no** raw referrer URL and **no**
+/// cross-site identifier. The referrer is reduced to its host at write
+/// time, so the full URL — which could carry campaign parameters or a
+/// session token in a query string — never reaches the database.
+///
+/// The `visitorId` is a random id from a first-party cookie. It is not
+/// the user id, and it is not a fingerprint: a visitor who clears
+/// cookies, or who uses two browsers, is two visitors. A signed-in
+/// customer's traffic is still bucketed like anyone else's, and the two
+/// are never joined.
+model TrafficEvent {
+  id String @id @default(cuid())
+
+  /// The channel, from the closed taxonomy in `src/lib/traffic.ts`:
+  /// "facebook" | "organic" | "direct" | "email" | "other".
+  ///
+  /// A bucketed value, not a raw referrer. The bucket is what the donut
+  /// shows; the host below is kept for diagnosis only.
+  source String @db.VarChar(40)
+
+  /// The referrer's **host** only — "facebook.com", not the full URL.
+  ///
+  /// Null for direct traffic. Kept for diagnosis ("which host is
+  /// sending us traffic that is bucketed as `other`?"), never displayed
+  /// as a breakdown of its own.
+  referrerHost String? @db.VarChar(255)
+
+  /// The landing path, e.g. "/products?sort=new". Query strings are
+  /// stripped at write time.
+  path String @db.VarChar(255)
+
+  /// A pseudonymous first-party visitor id, from the `egb_vid` cookie.
+  ///
+  /// Random, not derived from anything about the visitor. Not the user
+  /// id — a visitor need not be signed in.
+  visitorId String @db.VarChar(64)
+
+  createdAt DateTime @default(now())
+
+  /// The traffic widget sorts by `createdAt` and filters by `source`.
+  @@index([createdAt(sort: Desc)])
+  @@index([source, createdAt(sort: Desc)])
+  @@map("traffic_events")
 }

@@ -1,0 +1,35 @@
+-- The audit action for an administrator editing their own profile.
+--
+-- ── Why this is its own action, and not a reused one ───────────────────────
+--
+-- The shop's settings already have `SITE_SETTINGS_UPDATED`, and it would
+-- be tempting to reach for it here. But the two are different subjects:
+--
+--   • `SITE_SETTINGS_UPDATED` describes the **shop's** configuration —
+--     the announcement marquee, the support contact details. Every
+--     customer sees those, and every admin sees them.
+--
+--   • This one describes **one person's** account — the name in the top
+--     bar, the telephone number on their own record. It affects nobody
+--     else.
+--
+-- So the trail has to be able to answer "who changed the shop's
+-- announcement?" and "who changed their own phone number?" as two
+-- different questions. A reused action would blur them into one, and
+-- the audit explorer could no longer filter for either.
+--
+-- ── Why the value is added on its own ──────────────────────────────────────
+--
+-- `ALTER TYPE ... ADD VALUE` cannot run inside a transaction block on
+-- PostgreSQL below version 12, and the codebase's other enum-addition
+-- migrations are separate for the same reason. Keeping this migration
+-- to the vocabulary alone means the schema change and the vocabulary
+-- change can be reasoned about independently.
+--
+-- ── Note on `emailVerifiedAt` ──────────────────────────────────────────────
+--
+-- The administrator's **email address** is deliberately not editable
+-- from the profile form, so this migration adds no columns at all — the
+-- `users` table already carries everything the form writes. The
+-- reasoning for excluding the email is in `src/lib/admin/profile.ts`.
+ALTER TYPE "AdminAction" ADD VALUE 'ADMIN_PROFILE_UPDATED';

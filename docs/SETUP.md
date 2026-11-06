@@ -161,18 +161,51 @@ development only.
 | `DATABASE_URL` | PostgreSQL connection string |
 | `AUTH_JWT_SECRET` | HMAC key for session tokens. **Must be ≥32 bytes.** Generate with `node -e "console.log(require('crypto').randomBytes(48).toString('base64url'))"` |
 | `AUTH_JWT_TTL_SECONDS` | Session lifetime (604800 = 7 days) |
-| `AI_PROVIDER` | `mock` (default, offline, deterministic) or `openai` |
+| `AI_PROVIDER` | `mock` (default, offline, deterministic), `openai`, `gemini` or `openrouter` |
 | `OPENAI_API_KEY` | Only needed when `AI_PROVIDER=openai` |
+| `GEMINI_API_KEY` | Only needed when `AI_PROVIDER=gemini` |
+| `GEMINI_MODEL` | The Gemini model. Defaults to `gemini-3.5-flash` |
+| `OPENROUTER_API_KEY` | Only needed when `AI_PROVIDER=openrouter` |
+| `OPENROUTER_MODEL` | The OpenRouter model id. Must exist on OpenRouter **and must be multimodal** — a text-only model is rejected outright on a photo. Defaults to `deepseek/deepseek-v4.1-flash-1017` |
+| `OPENROUTER_TITLE` | The app name OpenRouter shows on its dashboard. Optional |
 | `STORAGE_DRIVER` | `local` — writes under `UPLOAD_ROOT` |
 | `UPLOAD_ROOT` | `./public/uploads` |
 | `MAX_IMAGE_BYTES` | 5 MB |
 | `MAX_VIDEO_BYTES` | 50 MB |
 | `SMS_GATEWAY` | `mock` — writes to the `sms_logs` table |
+| `EMAIL_HOST` | SMTP host. Defaults to `smtp.gmail.com` |
+| `EMAIL_PORT` | SMTP port. Defaults to `587` (Gmail submission, STARTTLS) |
+| `EMAIL_USER` | The Gmail account that sends the sign-in code. **Required** for the OTP flow |
+| `EMAIL_PASS` | A Google **app password** — *not* the account password. **Required** for the OTP flow |
+| `EMAIL_FROM` | The `From` address. Must be one the authenticated account may send as |
 | `DISCLAIMER_TEXT` | Last-resort fallback. The live value is the `AiConfig` row. |
 
 The `.env` currently in the repo is a development placeholder with
 `AUTH_JWT_SECRET="dev-only-secret-change-me-in-production-8f3a9c2b1d4e5f6a"`.
 Replace it before any deployment.
+
+### The email variables, in a little more detail
+
+The sign-in code is emailed over Gmail SMTP, and there is **no mock
+driver** for it — unlike the SMS gateway above. That is deliberate: the
+email carries the one-time password, and a silently dropped email is a
+sign-in that appears to work and then does not. A missing `EMAIL_USER` or
+`EMAIL_PASS` is a hard failure, and the send endpoint answers `503` saying
+so.
+
+To get an app password:
+
+1. Turn on **2-Step Verification** on the Google account.
+2. Create an app password at <https://myaccount.google.com/apppasswords>.
+3. Put that 16-character app password in `EMAIL_PASS`.
+
+A normal Google account password will **not** work, and the rejection
+arrives as an opaque authentication error rather than as "wrong password" —
+which is why the app password is mandatory.
+
+`GET /api/health` reports `email: "configured" | "not-configured"`, so a
+deployment that cannot send email says so on a dashboard rather than at the
+customer's sign-in screen.
 
 ---
 
@@ -189,6 +222,33 @@ npm run db:seed      # seed data
 npm run db:studio    # Prisma Studio
 npm run db:reset     # drop + recreate + reseed (destructive)
 ```
+
+### Live provider checks
+
+These make **real** calls and spend credit. They do not write to the
+database and they do not touch the storefront.
+
+```bash
+npm run verify:openrouter                 # one live call, end to end
+npm run verify:openrouter:conversation     # greeting / advice / photo
+npm run probe:openrouter:vision            # can this model read images?
+npm run probe:openrouter:tools             # does this model emit tool calls?
+npm run probe:openrouter:endpoints         # how many upstream providers, and do they support tools?
+npm run probe:openrouter:channels          # which channel is carrying the product ids?
+npm run probe:openrouter:credits           # how much credit is left on the key?
+```
+
+The last one matters after a `402`: OpenRouter reserves credit against
+the model's **maximum** context window when a request does not state its
+own `max_tokens` ceiling, and refuses the request when the balance
+cannot cover the reservation. The provider now states its own ceiling,
+so a `402` means the balance is genuinely too small for a paid model.
+A `:free` model tier is served without a balance and keeps working.
+
+Every probe states its own `max_tokens` for the same reason. A probe
+that 402s has not measured anything, so each one reports a `402` as
+**unknown** rather than as a finding about the model — otherwise you
+end up replacing a model id that was working fine.
 
 ---
 
@@ -224,7 +284,8 @@ euro-glam-bd/
 │   │   ├── layout.tsx
 │   │   └── page.tsx
 │   └── lib/
-│       ├── ai/                   # provider.ts, mock, openai, service
+│       ├── ai/                   # provider.ts, mock, openai, gemini,
+│       │                         #   openrouter, openai-compatible, service
 │       ├── api/                  # types.ts, respond.ts
 │       ├── auth/                 # jwt.ts, session.ts, guards.ts
 │       ├── conflicts/            # catalogue.ts, rules.ts, engine.ts
