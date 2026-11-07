@@ -97,7 +97,7 @@ describe("the callback URLs", () => {
     const previous = process.env.NEXT_PUBLIC_SITE_URL;
 
     try {
-      process.env.NEXT_PUBLIC_SITE_URL = "https://euroglambd.com";
+      process.env.NEXT_PUBLIC_SITE_URL = "https://euro-glam-bd.vercel.app";
       const urls = buildCallbackUrls();
 
       for (const url of Object.values(urls)) {

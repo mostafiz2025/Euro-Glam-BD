@@ -25,7 +25,7 @@
  * visibly wrong link rather than a crash — a broken link is a support
  * ticket, a crash is an outage.
  */
-const DEFAULT_SITE_URL = "https://euroglambd.com";
+const DEFAULT_SITE_URL = "https://euro-glam-bd.vercel.app";
 
 /**
  * The input to the depletion reminder template.
