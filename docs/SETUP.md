@@ -172,6 +172,8 @@ development only.
 | `CLOUDINARY_CLOUD_NAME` | Only needed when `STORAGE_DRIVER=cloudinary`. The cloud name from the Cloudinary console |
 | `CLOUDINARY_API_KEY` | Only needed when `STORAGE_DRIVER=cloudinary`. The API key from the same console panel |
 | `CLOUDINARY_API_SECRET` | Only needed when `STORAGE_DRIVER=cloudinary`. The API secret from the same console panel |
+| `NEXT_PUBLIC_STORAGE_DRIVER` | **Must match `STORAGE_DRIVER`.** The image URL is derived on the client as well as the server, and Next.js inlines only `NEXT_PUBLIC_*` variables into the browser bundle. Without this, the admin's image previews are blank |
+| `NEXT_PUBLIC_CLOUDINARY_CLOUD_NAME` | **Must match `CLOUDINARY_CLOUD_NAME`.** The same reason. Carries no secret — the cloud name is already visible in every public image URL |
 | `UPLOAD_ROOT` | `./public/uploads` |
 | `MAX_IMAGE_BYTES` | 5 MB |
 | `MAX_VIDEO_BYTES` | 50 MB |
@@ -225,6 +227,49 @@ npm run db:seed      # seed data
 npm run db:studio    # Prisma Studio
 npm run db:reset     # drop + recreate + reseed (destructive)
 ```
+
+### Switching the storage driver
+
+`STORAGE_DRIVER` picks the driver, but **the switch does not move the
+files that are already stored**. Every image row holds a key, and after
+the switch that key is looked up in the new driver's namespace — where
+nothing was ever written. The images render as broken until they are
+migrated.
+
+Two commands handle that:
+
+```bash
+npm run storage:backfill          # dry run — reports what would move
+npm run storage:backfill -- --apply   # uploads to Cloudinary, rewrites the rows
+npm run storage:verify             # checks every stored key resolves
+npm run storage:verify-bytes       # checks the bytes are real images
+```
+
+The backfill uploads each local file under a **recognisable** key (the
+original path, with the three characters Cloudinary refuses — `%`, `&`,
+`#` — substituted) and rewrites the database rows to match. It never
+deletes the local files, so the change can be reversed by pointing
+`STORAGE_DRIVER` back at `local`.
+
+When you switch to Cloudinary, set **both** the server-only variables and
+their `NEXT_PUBLIC_` twins — see the table in *Step 3 — Environment
+variables* above.
+
+Two things about the verification commands are worth knowing.
+
+**A `200` is not proof of an image.** `storage:verify` checks that every
+key in the database resolves to *something* on the CDN.
+`storage:verify-bytes` checks that the bytes are a JPEG, a PNG or a WebP.
+Without the second check an error page counts as a resolved asset, and the
+failure shows up as a blank frame in the browser rather than as a failed
+verification.
+
+**A freshly uploaded asset may 404 for a short while.** Cloudinary's
+delivery edge needs a moment to replicate a new upload to the CDN's
+delivery point. If you verify immediately after a migration, the last few
+assets can come back 404 and be perfectly fine. Give it a minute and
+re-run before concluding that a key is broken — and before "fixing" a key
+that is already correct.
 
 ### Live provider checks
 

@@ -30,7 +30,10 @@
     "db:deploy": "prisma migrate deploy",
     "db:seed": "prisma db seed",
     "db:studio": "prisma studio",
-    "db:reset": "prisma migrate reset --force"
+    "db:reset": "prisma migrate reset --force",
+    "storage:backfill": "tsx scripts/backfill-images-to-cloudinary.ts",
+    "storage:verify": "tsx scripts/verify-images.ts",
+    "storage:verify-bytes": "tsx scripts/verify-image-bytes.ts"
   },
   "dependencies": {
     "@google/genai": "^2.32.0",

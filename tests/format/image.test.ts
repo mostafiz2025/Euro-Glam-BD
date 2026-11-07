@@ -241,3 +241,122 @@ describe("the URL for the configured driver", () => {
     );
   });
 });
+
+/**
+ * The URL in the browser.
+ *
+ * ── Why this block exists ────────────────────────────────────────────────
+ *
+ * `imageUrl()` is imported by **client components** — the admin image
+ * picker's preview grid, the discovery image field. Next.js inlines only
+ * `NEXT_PUBLIC_*` variables into the browser bundle; every other name
+ * compiles to a lookup on an empty object, so on the client
+ * `process.env.STORAGE_DRIVER` is always `undefined`.
+ *
+ * That produced a page that disagreed with itself. The server-rendered
+ * parts read the real driver name and produced a Cloudinary URL; the
+ * client components read `undefined`, fell back to `"local"`, and
+ * produced `/uploads/<key>` — a path that resolves to nothing under the
+ * Cloudinary driver. The admin's image previews were blank while the
+ * table around them looked right.
+ *
+ * The public twins are what fix it, and these tests hold them to that.
+ */
+describe("the URL in the browser", () => {
+  const originalPublicDriver = process.env.NEXT_PUBLIC_STORAGE_DRIVER;
+  const originalPublicCloudName =
+    process.env.NEXT_PUBLIC_CLOUDINARY_CLOUD_NAME;
+  const originalDriver = process.env.STORAGE_DRIVER;
+  const originalCloudName = process.env.CLOUDINARY_CLOUD_NAME;
+
+  /**
+   * Empties the environment, the way a browser bundle sees it.
+   *
+   * `PATH` is kept because some tooling reads it; nothing here does.
+   */
+  function emptyEnvironment(): void {
+    for (const name of Object.keys(process.env)) {
+      if (name !== "PATH") delete process.env[name];
+    }
+  }
+
+  afterEach(() => {
+    const restore = (name: string, value: string | undefined) => {
+      if (value === undefined) {
+        delete process.env[name];
+      } else {
+        process.env[name] = value;
+      }
+    };
+
+    restore("NEXT_PUBLIC_STORAGE_DRIVER", originalPublicDriver);
+    restore("NEXT_PUBLIC_CLOUDINARY_CLOUD_NAME", originalPublicCloudName);
+    restore("STORAGE_DRIVER", originalDriver);
+    restore("CLOUDINARY_CLOUD_NAME", originalCloudName);
+  });
+
+  it("derives the Cloudinary URL from the public variables alone", () => {
+    /*
+     * The browser sees exactly two variables: the public driver name and
+     * the public cloud name. The server-only names are absent.
+     */
+    emptyEnvironment();
+
+    process.env.NEXT_PUBLIC_STORAGE_DRIVER = "cloudinary";
+    process.env.NEXT_PUBLIC_CLOUDINARY_CLOUD_NAME = "test-cloud";
+
+    expect(imageUrl("products/2026/11/abc123.png")).toBe(
+      "https://res.cloudinary.com/test-cloud/image/upload/euro-glam-bd/products/2026/11/abc123",
+    );
+  });
+
+  it("does not produce an uploads path when only the public variables are set", () => {
+    // The whole point. A `/uploads` URL under Cloudinary resolves to
+    // nothing, so the preview is blank.
+    emptyEnvironment();
+
+    process.env.NEXT_PUBLIC_STORAGE_DRIVER = "cloudinary";
+    process.env.NEXT_PUBLIC_CLOUDINARY_CLOUD_NAME = "test-cloud";
+
+    expect(imageUrl("products/2026/11/abc123.png")).not.toContain("/uploads");
+  });
+
+  it("falls back to the uploads path when the public driver is local", () => {
+    emptyEnvironment();
+
+    process.env.NEXT_PUBLIC_STORAGE_DRIVER = "local";
+
+    expect(imageUrl("products/2026/11/abc123.png")).toBe(
+      `${IMAGE_URL_PREFIX}/products/2026/11/abc123.png`,
+    );
+  });
+
+  it("prefers the public variables over the server-only ones", () => {
+    /*
+     * The public twin is the one the browser has, so it wins. If the two
+     * ever disagree, the browser's answer is the one that has to be
+     * right there — and the deployment's configuration is wrong.
+     */
+    process.env.STORAGE_DRIVER = "local";
+    process.env.CLOUDINARY_CLOUD_NAME = "server-cloud";
+    process.env.NEXT_PUBLIC_STORAGE_DRIVER = "cloudinary";
+    process.env.NEXT_PUBLIC_CLOUDINARY_CLOUD_NAME = "public-cloud";
+
+    expect(imageUrl("products/2026/11/abc123.png")).toContain(
+      "public-cloud",
+    );
+  });
+
+  it("still works on the server, from the server-only variables", () => {
+    // The server has both. The public twin may not be set in a server-only
+    // deployment, and the server-only name is the fallback.
+    emptyEnvironment();
+
+    process.env.STORAGE_DRIVER = "cloudinary";
+    process.env.CLOUDINARY_CLOUD_NAME = "server-cloud";
+
+    expect(imageUrl("products/2026/11/abc123.png")).toBe(
+      "https://res.cloudinary.com/server-cloud/image/upload/euro-glam-bd/products/2026/11/abc123",
+    );
+  });
+});

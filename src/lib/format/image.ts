@@ -34,6 +34,28 @@
  * driver name comes from `STORAGE_DRIVER`. Both are read at call time
  * rather than at module load, so the value reflects the environment the
  * page is actually being rendered in.
+ *
+ * ── Why the driver name has a `NEXT_PUBLIC_` twin ────────────────────────
+ *
+ * This module is imported by **client components** — the admin image
+ * picker's preview grid and the discovery image field are both
+ * `"use client"`. Next.js inlines only `NEXT_PUBLIC_*` variables into the
+ * browser bundle; every other name compiles to a lookup on an empty
+ * object.
+ *
+ * So the driver name and the cloud name each have a public twin:
+ *
+ *   • `NEXT_PUBLIC_STORAGE_DRIVER`
+ *   • `NEXT_PUBLIC_CLOUDINARY_CLOUD_NAME`
+ *
+ * The public names are read first, and the server-only names are the
+ * fallback. The server has both; the browser has only the public ones.
+ *
+ * Without the public twins this module was **half working**: the
+ * server-rendered pages produced Cloudinary URLs and looked correct,
+ * while the client components fell back to `/uploads/<key>` and showed
+ * blank previews. The two halves of the same page disagreed about where
+ * the image lived.
  */
 
 /**
@@ -57,13 +79,37 @@ const CLOUDINARY_FOLDER = "euro-glam-bd";
 /**
  * The configured storage driver, read at call time.
  *
+ * ── Why the public variable comes first ───────────────────────────────────
+ *
+ * `process.env.STORAGE_DRIVER` is a **server-only** variable. Next.js
+ * inlines only `NEXT_PUBLIC_*` variables into the browser bundle; every
+ * other name compiles to a lookup on an empty object, so on the client it
+ * is always `undefined`.
+ *
+ * That is not a subtlety — it is the whole bug this module had:
+ *
+ *   • The **server-rendered** pages read the real value and produced a
+ *     Cloudinary URL, so the storefront and the admin table looked right.
+ *   • The **client components** — the admin image picker's preview grid,
+ *     the discovery image field — read `undefined`, fell back to
+ *     `"local"`, and produced `/uploads/<key>`. Under the Cloudinary
+ *     driver that path resolves to nothing, so the previews were blank.
+ *
+ * So the browser has to be given the configuration explicitly, through a
+ * `NEXT_PUBLIC_*` variable. The server-only name is still read as a
+ * fallback, because the server has both — and the server is where the
+ * authoritative answer lives.
+ *
  * The value is normalised exactly as `getStorageDriverName()` in
  * `src/lib/storage/index.ts` normalises it, so the two agree on what
  * "cloudinary" means. Anything that is not `cloudinary` is the local
  * driver — which is also what the dispatch falls back to.
  */
 function configuredDriver(): string {
-  return process.env.STORAGE_DRIVER?.trim().toLowerCase() || "local";
+  const configured =
+    process.env.NEXT_PUBLIC_STORAGE_DRIVER ?? process.env.STORAGE_DRIVER;
+
+  return configured?.trim().toLowerCase() || "local";
 }
 
 /**
@@ -73,12 +119,19 @@ function configuredDriver(): string {
  * the SDK is a server-side dependency and this module is imported by
  * client components. The cloud name is the one piece of configuration
  * the URL needs.
+ *
+ * The same public-first rule applies: the browser only sees the
+ * `NEXT_PUBLIC_` name, and the server-only name is the fallback.
  */
 function cloudinaryCloudName(): string {
-  const configured = process.env.CLOUDINARY_CLOUD_NAME?.trim();
+  const configured =
+    process.env.NEXT_PUBLIC_CLOUDINARY_CLOUD_NAME ??
+    process.env.CLOUDINARY_CLOUD_NAME;
 
-  if (configured) {
-    return configured;
+  const trimmed = configured?.trim();
+
+  if (trimmed) {
+    return trimmed;
   }
 
   /*

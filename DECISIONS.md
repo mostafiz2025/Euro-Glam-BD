@@ -1,6 +1,6 @@
 # Architecture Decisions — Euro Glam BD MVP
 
-All 12 foundational decisions locked and approved, and 255 numbered decisions in total. This file is the source of truth; code must conform to it.
+All 12 foundational decisions locked and approved, and 261 numbered decisions in total. This file is the source of truth; code must conform to it.
 
 | # | Area | Decision |
 |---|------|----------|
@@ -4287,6 +4287,12 @@ The storage adapter interface was written for the local filesystem, with the exp
 | 90 | The storefront URL is derived from the configured driver | `imageUrl()` in `src/lib/format/image.ts` reads `STORAGE_DRIVER` and produces a Cloudinary URL or a `/uploads` path. It cannot import the driver: that module pulls `node:fs` into the browser bundle, which is a build error at best. |
 | 91 | The driver and the client derive the **same** URL | `getUrl()` builds the URL by hand rather than through `cloudinary.url()`. The SDK's builder emits a **signed** URL (`?_a=<signature>`) derived from the API secret, which the browser bundle cannot reproduce without leaking the secret. The two derivations have to agree, because the image optimiser caches by URL — a mismatch would be two separate cached copies of the same picture. |
 | 92 | The Cloudinary configuration must be **applied**, not merely read | `getUrl()` called `readConfig()` without `applyConfig()`. `cloudinary.url()` builds the delivery URL from the SDK's own configuration, so without a cloud name it has nothing to put in the hostname and throws. The bug was invisible while every call site happened to upload first — which configured the SDK as a side effect. |
+| 93 | The driver name has a `NEXT_PUBLIC_` twin | `process.env.STORAGE_DRIVER` is **server-only**. Next.js inlines only `NEXT_PUBLIC_*` variables into the browser bundle, so on the client it is always `undefined`. The client-side derivation therefore reads `NEXT_PUBLIC_STORAGE_DRIVER` first, and `NEXT_PUBLIC_CLOUDINARY_CLOUD_NAME` for the cloud name, with the server-only names as the fallback. |
+| 94 | The switch does not move the files | Changing `STORAGE_DRIVER` changes where new uploads go. It does **not** move the files that are already stored — every row holds a key, and after the switch that key is looked up in the new driver's namespace, where nothing was ever written. The assets have to be migrated explicitly. |
+| 95 | The migration keeps the original filename | The backfill uploads each file under its original path, minus the three characters Cloudinary refuses in a public id (`%`, `&`, `#`), and rewrites the rows to match. A recognisable key makes the migration legible in the admin panel and makes it idempotent — a second run finds the asset already there and skips it. |
+| 96 | The migration never deletes | The local files stay where they are and the database is the only thing that changes, so the switch can be reversed by pointing `STORAGE_DRIVER` back at `local`. A migration that removed the source would make the change irreversible for no benefit. |
+| 97 | A freshly uploaded asset may 404 on its delivery URL | The migration's last five assets came back 404 while `curl` was run within seconds of the upload, and 200 when the same request was made a minute later. Cloudinary's delivery edge needs a moment to replicate. A verification run that reads too early measures propagation delay, not a broken key — and the extension was never in the stored public id. |
+| 98 | A 200 is not proof of an image | `scripts/verify-images.ts` checks that a URL resolves. `scripts/verify-image-bytes.ts` checks that the bytes are a JPEG, a PNG or a WebP. Without the second check an error page counts as a resolved asset, and the failure surfaces as a blank frame in the browser rather than as a failed verification. |
 
 ### Why the driver was not simply switched on
 
@@ -4371,6 +4377,82 @@ The bug was invisible to the driver's own tests, because every one of them calle
 
 This is what the adapter conformance test (`tests/storage/adapter-conformance.test.ts`) is for. It exercises every driver through the interface alone, with no knowledge of the other's behaviour, and it called `getUrl()` on a freshly constructed driver. It found the bug on its first run.
 
+### The page that disagreed with itself
+
+The driver was correct, the `remotePatterns` were correct, and the storefront was correct. The **admin panel** was still blank, and the reason was not visible in any of the code that had been changed.
+
+`src/lib/format/image.ts` derives the URL on the client as well as the server, and it read `process.env.STORAGE_DRIVER`. That is a **server-only** variable: Next.js inlines only `NEXT_PUBLIC_*` names into the browser bundle, and every other name compiles to a lookup on an empty object. So on the client the value was always `undefined`, the driver check fell back to `"local"`, and the URL came out as `/uploads/<key>` — a path that resolves to nothing under the Cloudinary driver.
+
+The result was a page that contradicted itself:
+
+| Part of the admin panel | How it renders | What it produced |
+|---|---|---|
+| The product table's thumbnail | server-rendered | a correct Cloudinary URL |
+| The image picker's preview grid | client component | `/uploads/<key>` — blank |
+| The discovery image field | client component | `/uploads/<key>` — blank |
+
+The fix is a **public twin** for each piece of configuration the client needs:
+
+```bash
+NEXT_PUBLIC_STORAGE_DRIVER="cloudinary"
+NEXT_PUBLIC_CLOUDINARY_CLOUD_NAME="yexokeng"
+```
+
+The public names are read first and the server-only names are the fallback, so the server — which has both — still works, and the browser — which has only the public ones — works too. Neither carries a secret: the cloud name is already visible in every public image URL.
+
+This is worth writing down because it is invisible in the source. `process.env.STORAGE_DRIVER` looks like it works everywhere; it only works on the server. The compiled client bundle shows the difference plainly — before the fix, the driver check compiled to a lookup on an empty object; after it, the check compiles to `"cloudinary"===("cloudinary".trim()…)`.
+
+### The switch does not move the files
+
+The other half of the broken previews was not a URL problem at all.
+
+Every image row in the catalogue holds a **key**, and the files those keys named were on the local disk, in `public/uploads`. The driver was then switched to Cloudinary, which changed where *new* uploads went — and changed nothing about the 37 assets already referenced by the database. The keys resolved to `https://res.cloudinary.com/yexokeng/image/upload/euro-glam-bd/products/Bioderma Sensibio`, and nothing had ever been uploaded under that name. Every one of them was a 404.
+
+The URL was never wrong. The **bytes** were on the wrong side of the migration.
+
+So the migration is explicit, and it is a script rather than a config change: `scripts/backfill-images-to-cloudinary.ts`.
+
+| Property | Why |
+|---|---|
+| A dry run by default | Nothing is written until `--apply` is passed |
+| The key keeps the original filename | The migration is legible in the admin panel, and idempotent — a second run skips what is already there |
+| It never deletes | The local files stay, so the switch can be reversed by pointing `STORAGE_DRIVER` back at `local` |
+| It rewrites the row | Three of the keys had to change, and the row has to follow the asset |
+
+Three of the thirty-seven keys changed. Cloudinary refuses `%`, `&` and `#` in a public id — a fact established by uploading to the live account, since a 404 cannot distinguish "invalid id" from "not uploaded", and only an actual upload can. Spaces, em-dashes, `+`, parentheses, commas and accented letters are all accepted unchanged, which is why only three keys needed rewriting.
+
+### A 404 straight after an upload is not always a 404
+
+The migration finished and reported 37/37 uploaded, but five of the assets — the ones uploaded last — came back 404 on a bare `curl` against the delivery URL. The obvious reading was that their public id carried the extension, because the same five resolved when `.jpg` was appended.
+
+That reading was wrong, and the way it was wrong is worth recording.
+
+`curl` said 404 and returned it twenty times in a row. The Node script in `scripts/verify-images.ts` said 200 and returned it forty-two times in a row. Neither was flapping: each tool was consistent, and they disagreed with each other. The difference was **when** they ran. Cloudinary's edge takes a moment to replicate a freshly uploaded asset to the delivery point, and the five that had been uploaded seconds earlier had not propagated yet. The Node run happened later and saw them.
+
+The check that settled it was to re-request the same URL twenty times after the propagation window: 200 on every one. And the extension was never in the stored public id — `cloudinary.url()` appends the format as a separate asset field, and the public id it reports back has no extension. The bare form and the `.jpg` form both serve, because Cloudinary resolves either.
+
+So: **an asset that was just uploaded may 404 on its delivery URL for a short window.** A verification run that reads "some assets 404" immediately after a migration has measured propagation delay, not a broken key. The rule for the next migration is to let the window pass before concluding anything.
+
+### How the fix was verified
+
+Verifying that an image *resolves* is not the same as verifying that it *renders*. The chain has four links — the key in the database, the URL derived from it, the optimiser's willingness to fetch that URL, and the bytes the optimiser gets back — and a break in any one of them looks identical in the browser: a blank frame.
+
+Each link was checked separately:
+
+| Link | How it was checked | Result |
+|------|--------------------|--------|
+| The key resolves | `scripts/verify-images.ts` — HTTP HEAD on every distinct key in the database | 37/37 |
+| The bytes are an image | `scripts/verify-image-bytes.ts` — magic numbers, not just a 200 | 37/37 real images |
+| The admin panel renders external URLs | The rendered `/admin/products` HTML was fetched and scanned | 18 distinct Cloudinary URLs, zero `/uploads` paths |
+| The optimiser accepts the host | Every `/_next/image?url=…` on that page was requested | 18/18 returned a real JPEG |
+| The storefront renders external URLs | The rendered `/` HTML was fetched and scanned | 22 distinct Cloudinary URLs, 22/22 through the optimiser |
+| The client bundle has the configuration | The compiled chunk was read | `"cloudinary"===("cloudinary".trim()…)`, `e="yexokeng".trim()\|\|""` |
+| An upload produces an external URL | A real PNG was uploaded through `/api/admin/products/images` | key `products/2026/11/470d7ef8….png`, url `https://res.cloudinary.com/yexokeng/image/upload/euro-glam-bd/products/2026/11/470d7ef8…` |
+
+The last one is the one that matters most, because it is the only check that exercises the whole chain in one go: a file goes in, a key comes out, a URL comes out, and the URL serves the bytes that went in. The upload response carries **both** — `key` for the database and `url` for the browser — and the two are deliberately different things. The key is what is persisted; the URL is what is displayed. A component that stores the URL instead of the key turns the next migration into a data rewrite.
+
+The uploaded probe was destroyed from Cloudinary afterwards, so the account holds only the shop's own assets.
+
 ### The guard rails
 
 | Rule | Where it lives | Why |
@@ -4395,6 +4477,13 @@ This is what the adapter conformance test (`tests/storage/adapter-conformance.te
 | The URL is unsigned | `cloudinary.ts` → `getUrl` | The signature needs the API secret, which the browser must never see |
 | The configuration is applied, not just read | `cloudinary.ts` → `getUrl` | The SDK builds the URL from its own configuration |
 | Every driver honours the same contract | `tests/storage/adapter-conformance.test.ts` | A driver that breaks the interface breaks every caller |
+| The client reads a `NEXT_PUBLIC_` twin | `src/lib/format/image.ts` → `configuredDriver` | A server-only variable is `undefined` in the browser, so the two halves of a page would disagree |
+| The public twin wins over the server-only name | `src/lib/format/image.ts` → `configuredDriver` | The browser only has the public one, so it is the one that has to be right there |
+| Switching drivers does not move the files | `scripts/backfill-images-to-cloudinary.ts` | The keys name a namespace that the new driver has never been written to |
+| The migration never deletes the source | `scripts/backfill-images-to-cloudinary.ts` | The switch has to stay reversible |
+| The migration is a dry run by default | `scripts/backfill-images-to-cloudinary.ts` | Writing 37 assets to a live account is not something to do by accident |
+| A freshly uploaded asset may 404 briefly | `scripts/verify-images.ts` | The delivery edge needs a moment to replicate; a 404 read too early measures propagation, not a broken key |
+| A 200 is not proof of an image | `scripts/verify-image-bytes.ts` | The bytes have to be checked for magic numbers, or an error page counts as a resolved asset |
 
 
 
