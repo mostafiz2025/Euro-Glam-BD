@@ -364,6 +364,30 @@ describe("CloudinaryStorageDriver", () => {
 
       expect(result).not.toBe("advisor/2026/10/abc.png");
     });
+
+    it("produces the plain unsigned URL the client can also derive", () => {
+      /*
+       * The storefront derives its URL from the key on the client, in
+       * `src/lib/format/image.ts`. The client cannot reproduce the
+       * SDK's `?_a=` signature without the API secret, so the driver
+       * must not emit one — otherwise the same picture would be two
+       * separate cached copies under the two URL forms.
+       */
+      const result = driver.getUrl("advisor/2026/10/abc.png");
+
+      expect(result).toBe(
+        "https://res.cloudinary.com/test-cloud/image/upload/euro-glam-bd/advisor/2026/10/abc",
+      );
+      expect(result).not.toContain("?_a=");
+    });
+
+    it("does not use the SDK's URL builder", () => {
+      // The SDK's builder produces the signed, versioned form. The
+      // driver builds its own.
+      driver.getUrl("advisor/2026/10/abc.png");
+
+      expect(url).not.toHaveBeenCalled();
+    });
   });
 
   describe("exists", () => {

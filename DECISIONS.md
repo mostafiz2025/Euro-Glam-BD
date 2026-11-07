@@ -1,6 +1,6 @@
 # Architecture Decisions — Euro Glam BD MVP
 
-All 12 foundational decisions locked and approved, and 250 numbered decisions in total. This file is the source of truth; code must conform to it.
+All 12 foundational decisions locked and approved, and 255 numbered decisions in total. This file is the source of truth; code must conform to it.
 
 | # | Area | Decision |
 |---|------|----------|
@@ -4282,6 +4282,11 @@ The storage adapter interface was written for the local filesystem, with the exp
 | 85 | The scope is still an allow-list | The Cloudinary driver rejects anything outside `STORAGE_SCOPES`, exactly as the local one does. |
 | 86 | Malformed keys are refused before the API | A key must be four segments with none of them `.` or `..`. The local driver asserts the same shape on the filesystem; here it stops a crafted key reaching an HTTP request. |
 | 87 | The `cloudinary` package is a real dependency | It was missing from `package.json` entirely, so the module did not resolve and the build failed. A driver that cannot be imported is not a driver. |
+| 88 | `res.cloudinary.com` is an allowed remote pattern | `next/image` **throws** — it does not warn, and it does not fall back — when a remote image's hostname is not in `images.remotePatterns`. The throw happens during the render, so it takes the whole page with it, not just the one picture. The `onError` fallback in `ProductImage` cannot catch it: the component never renders. |
+| 89 | The remote pattern is scoped to our own folder | `pathname: "/**/euro-glam-bd/**"`, not a bare `hostname` entry. A bare entry would allow the optimiser to be pointed at *any* image on Cloudinary's CDN — an open proxy for somebody else's traffic. |
+| 90 | The storefront URL is derived from the configured driver | `imageUrl()` in `src/lib/format/image.ts` reads `STORAGE_DRIVER` and produces a Cloudinary URL or a `/uploads` path. It cannot import the driver: that module pulls `node:fs` into the browser bundle, which is a build error at best. |
+| 91 | The driver and the client derive the **same** URL | `getUrl()` builds the URL by hand rather than through `cloudinary.url()`. The SDK's builder emits a **signed** URL (`?_a=<signature>`) derived from the API secret, which the browser bundle cannot reproduce without leaking the secret. The two derivations have to agree, because the image optimiser caches by URL — a mismatch would be two separate cached copies of the same picture. |
+| 92 | The Cloudinary configuration must be **applied**, not merely read | `getUrl()` called `readConfig()` without `applyConfig()`. `cloudinary.url()` builds the delivery URL from the SDK's own configuration, so without a cloud name it has nothing to put in the hostname and throws. The bug was invisible while every call site happened to upload first — which configured the SDK as a side effect. |
 
 ### Why the driver was not simply switched on
 
@@ -4307,6 +4312,65 @@ Three of the decisions above (73, 74, 79) are not things that can be read off a 
 
 Each of these was found by a failed lookup and then a look at what Cloudinary had actually stored. A guess here would have produced a driver that uploaded successfully and could never find its own files again — which is worse than a driver that refuses to work.
 
+### Why `next.config.ts` had to change
+
+The driver was correct and the storefront would still have been broken.
+
+`next/image` **throws** when a remote image's hostname is not listed in `images.remotePatterns`. It does not warn, and it does not fall back to a placeholder. The throw happens during the render, so it takes the **whole page** down rather than just the one picture — and the `onError` fallback in `ProductImage` cannot catch it, because the component never renders at all.
+
+So with the Cloudinary driver selected, every product page would have failed to render, with an error like `Invalid src prop … hostname "res.cloudinary.com" is not configured under images in your next.config.js`.
+
+The pattern is scoped to the project's own folder:
+
+```ts
+remotePatterns: [
+  {
+    protocol: "https",
+    hostname: "res.cloudinary.com",
+    pathname: "/**/euro-glam-bd/**",
+  },
+],
+```
+
+A bare `hostname` entry would also work, and would also allow the optimiser to be pointed at *any* image on Cloudinary's CDN — an open proxy for somebody else's traffic. The pathname confines it to this shop's own uploads.
+
+### Why the client derives the URL rather than asking the server
+
+`Product.images` holds storage keys, not URLs, so something has to turn a key into a URL at render time. There were two candidates:
+
+- **Ask the server.** The server knows the driver and could render the URL. But the same derivation has to happen in the admin console, in the product card, in the cart, in the hero banner — a server round trip for each would be a request per image on every page.
+- **Derive it on the client.** `imageUrl()` in `src/lib/format/image.ts` reads `STORAGE_DRIVER` and produces the right shape directly.
+
+The client-side derivation is the one that was chosen, and the constraint that shaped it is that this module is imported by **client components**. It therefore cannot import the driver — `src/lib/storage/index.ts` reaches the local driver, which imports `node:fs`, and pulling that into the browser bundle is a build error at best. So the URL is derived from the driver's *name*, read from the environment at call time.
+
+### Why the two derivations have to produce the same string
+
+The driver and the client both derive a URL from the same key. If they produced different strings, the same picture would be fetched under two URLs — and the image optimiser caches by URL, so the shop would hold two cached copies of every image, and the cache would never serve the second one.
+
+The first version of the driver's `getUrl()` used `cloudinary.url()`, which emits:
+
+```
+https://res.cloudinary.com/<cloud>/image/upload/v1/<public_id>?_a=<signature>
+```
+
+The client cannot reproduce that. The `?_a=` signature is derived from the API secret, and reproducing it in the browser bundle would mean shipping the secret to the client.
+
+Both the `v1/` version segment and the `?_a=` signature are optional — the asset serves without them, which was confirmed against the live CDN — so the driver's `getUrl()` now builds the plain form by hand:
+
+```
+https://res.cloudinary.com/<cloud>/image/upload/<folder>/<key-without-extension>
+```
+
+That is the same string the client derives, and a test asserts it.
+
+### The configuration bug the conformance test found
+
+`getUrl()` called `readConfig()` but never `applyConfig()`. `cloudinary.url()` builds the delivery URL from the SDK's own configuration, so with no cloud name applied there was nothing to put in the hostname, and it threw `Must supply cloud_name`.
+
+The bug was invisible to the driver's own tests, because every one of them called `put()` first — and `put()` applies the configuration as a side effect. The call that had no prior upload was the one that broke.
+
+This is what the adapter conformance test (`tests/storage/adapter-conformance.test.ts`) is for. It exercises every driver through the interface alone, with no knowledge of the other's behaviour, and it called `getUrl()` on a freshly constructed driver. It found the bug on its first run.
+
 ### The guard rails
 
 | Rule | Where it lives | Why |
@@ -4324,6 +4388,13 @@ Each of these was found by a failed lookup and then a look at what Cloudinary ha
 | The scope is an allow-list | `cloudinary.ts` → `put` | The same rule the local driver enforces |
 | A malformed key never reaches the API | `cloudinary.ts` → `resolveKey` | Four segments, none of them `.` or `..` |
 | The image and video namespaces stay apart | `cloudinary.ts` → `resourceTypeFor` | Cloudinary stores them separately, so the type must be decided consistently |
+| The CDN host is an allowed remote pattern | `next.config.ts` → `images.remotePatterns` | `next/image` throws on an unlisted host, taking the whole page down |
+| The pattern is scoped to our folder | `next.config.ts` → `images.remotePatterns` | A bare hostname entry would make the optimiser an open proxy |
+| The client derives the URL from the driver name | `src/lib/format/image.ts` → `imageUrl` | The driver cannot be imported into a client bundle — it pulls in `node:fs` |
+| The driver and the client agree on the URL | `cloudinary.ts` → `getUrl` | The optimiser caches by URL; a mismatch is two cached copies of one picture |
+| The URL is unsigned | `cloudinary.ts` → `getUrl` | The signature needs the API secret, which the browser must never see |
+| The configuration is applied, not just read | `cloudinary.ts` → `getUrl` | The SDK builds the URL from its own configuration |
+| Every driver honours the same contract | `tests/storage/adapter-conformance.test.ts` | A driver that breaks the interface breaks every caller |
 
 
 

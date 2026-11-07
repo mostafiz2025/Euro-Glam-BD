@@ -13,11 +13,27 @@
  * imports it would pull the Node filesystem module into the browser
  * bundle. That is a build error at best.
  *
- * So the URL prefix is re-declared here as a plain constant, and the
- * conversion is a string join. The value must match
- * `STORAGE_URL_PREFIX` in the environment and `LOCAL_URL_PREFIX` in
- * `src/lib/storage/local-driver.ts` — and the test for this module
- * asserts that it does.
+ * So the URL is derived here, from the same constants the drivers use,
+ * without importing either driver.
+ *
+ * ── Why the prefix is a function of the configured driver ────────────────
+ *
+ * The local driver serves files from `public/uploads`, which Next.js
+ * serves at `/uploads/<key>`. The Cloudinary driver serves them from
+ * `https://res.cloudinary.com/<cloud>/image/upload/<folder>/<key>`.
+ *
+ * A single hardcoded prefix cannot produce both. With `STORAGE_DRIVER`
+ * set to `cloudinary` and a hardcoded `/uploads`, every product image
+ * on the storefront would point at `/uploads/products/2026/11/abc.png`
+ * — a path that resolves to nothing, because the file was never written
+ * to the local disk. The catalogue would show the typographic
+ * placeholder for every product, and the images would be sitting in
+ * Cloudinary where nothing looked for them.
+ *
+ * So the derivation is a **pure function of the driver name**, and the
+ * driver name comes from `STORAGE_DRIVER`. Both are read at call time
+ * rather than at module load, so the value reflects the environment the
+ * page is actually being rendered in.
  */
 
 /**
@@ -30,6 +46,88 @@
  * Mirrors `LOCAL_URL_PREFIX` in `src/lib/storage/local-driver.ts`.
  */
 export const IMAGE_URL_PREFIX = "/uploads";
+
+/**
+ * The Cloudinary folder every upload is written under.
+ *
+ * Mirrors `CLOUDINARY_FOLDER` in `src/lib/storage/cloudinary.ts`.
+ */
+const CLOUDINARY_FOLDER = "euro-glam-bd";
+
+/**
+ * The configured storage driver, read at call time.
+ *
+ * The value is normalised exactly as `getStorageDriverName()` in
+ * `src/lib/storage/index.ts` normalises it, so the two agree on what
+ * "cloudinary" means. Anything that is not `cloudinary` is the local
+ * driver — which is also what the dispatch falls back to.
+ */
+function configuredDriver(): string {
+  return process.env.STORAGE_DRIVER?.trim().toLowerCase() || "local";
+}
+
+/**
+ * The Cloudinary cloud name, read at call time.
+ *
+ * The URL is built by hand rather than by the Cloudinary SDK, because
+ * the SDK is a server-side dependency and this module is imported by
+ * client components. The cloud name is the one piece of configuration
+ * the URL needs.
+ */
+function cloudinaryCloudName(): string {
+  const configured = process.env.CLOUDINARY_CLOUD_NAME?.trim();
+
+  if (configured) {
+    return configured;
+  }
+
+  /*
+   * No cloud name means no Cloudinary URL can be built. Falling back to
+   * the local prefix would point at a path that does not exist, which
+   * is the same broken picture the hardcoded prefix produced. An empty
+   * cloud name makes the image fail visibly in the admin console —
+   * where the mistake is being made — rather than silently on the
+   * storefront.
+   */
+  return "";
+}
+
+/**
+ * Removes the extension from a storage key.
+ *
+ * Mirrors `stripExtension()` in `src/lib/storage/cloudinary.ts`. A
+ * Cloudinary asset's **public id** does not carry its format — the
+ * format is a separate field of the asset — so the delivery URL must
+ * not carry it either.
+ */
+function stripExtension(key: string): string {
+  const lastSlash = key.lastIndexOf("/");
+  const lastDot = key.lastIndexOf(".");
+
+  if (lastDot <= lastSlash) {
+    return key;
+  }
+
+  return key.slice(0, lastDot);
+}
+
+/**
+ * The Cloudinary delivery URL for a storage key.
+ *
+ * The shape is exactly what `CloudinaryStorageDriver.getUrl()` produces:
+ * `https://res.cloudinary.com/<cloud>/image/upload/<folder>/<key>`.
+ *
+ * The two must agree. A key that produced one URL in the admin console
+ * and a different URL on the storefront would be a bug that only shows
+ * up when someone compares the two screens — and the image optimiser
+ * caches by URL, so the two would be two separate cached copies of the
+ * same picture.
+ */
+function cloudinaryUrl(key: string): string {
+  const cloudName = cloudinaryCloudName();
+
+  return `https://res.cloudinary.com/${cloudName}/image/upload/${CLOUDINARY_FOLDER}/${stripExtension(key)}`;
+}
 
 /**
  * Converts a storage key into a public URL.
@@ -67,11 +165,13 @@ export function imageUrl(key: string): string {
    */
   const legacyKey = legacyPathToStorageKey(withoutLeadingSlash);
 
-  if (legacyKey !== null) {
-    return `${IMAGE_URL_PREFIX}/${legacyKey}`;
+  const storageKey = legacyKey ?? withoutLeadingSlash;
+
+  if (configuredDriver() === "cloudinary") {
+    return cloudinaryUrl(storageKey);
   }
 
-  return `${IMAGE_URL_PREFIX}/${withoutLeadingSlash}`;
+  return `${IMAGE_URL_PREFIX}/${storageKey}`;
 }
 
 /**

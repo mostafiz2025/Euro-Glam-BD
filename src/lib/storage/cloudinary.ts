@@ -410,19 +410,31 @@ export class CloudinaryStorageDriver implements StorageAdapter {
    * Returns the public URL for a key.
    *
    * The URL is derived from the key, never stored alongside it.
+   *
+   * ── Why the URL is built by hand ────────────────────────────────────────
+   *
+   * `cloudinary.url()` produces
+   * `…/image/upload/v1/<public_id>?_a=<signature>` — a **signed** URL.
+   * The signature is derived from the API secret, which cannot be
+   * reproduced in the browser bundle without leaking the secret, so a
+   * client-side derivation of the URL could never match it.
+   *
+   * That matters: `src/lib/format/image.ts` derives the storefront URL
+   * from the key on the client, and the two derivations have to agree.
+   * A key that produced one URL in the admin console and a different
+   * URL on the storefront would be two separate cached copies of the
+   * same picture, because the image optimiser caches by URL.
+   *
+   * The `v1/` version segment and the `?_a=` signature are both
+   * optional — the asset serves without them — so the plain form is
+   * used, and it is the same string the client-side derivation
+   * produces.
    */
   getUrl(key: string): string {
     const resolved = this.resolveKey(key);
     const publicId = qualifiedPublicId(resolved);
 
-    // `readConfig()` is called for its side effect: it refuses to build
-    // a URL for a driver that is not configured.
-    readConfig();
-
-    return cloudinary.url(publicId, {
-      secure: true,
-      resource_type: resourceTypeForKey(resolved),
-    });
+    return `https://res.cloudinary.com/${readConfig().cloudName}/image/upload/${publicId}`;
   }
 
   /**

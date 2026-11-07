@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
   IMAGE_URL_PREFIX,
@@ -133,6 +133,111 @@ describe("firstImageUrl", () => {
   it("skips an empty entry and takes the next one", () => {
     expect(firstImageUrl(["", "products/2026/10/abc.png"])).toBe(
       `${IMAGE_URL_PREFIX}/products/2026/10/abc.png`,
+    );
+  });
+});
+
+/**
+ * The URL derivation follows the configured driver.
+ *
+ * `imageUrl()` is imported by client components, so it cannot import
+ * the storage module — that would pull `node:fs` into the browser
+ * bundle. It derives the URL from the driver's *name* instead, and the
+ * name comes from `STORAGE_DRIVER`.
+ *
+ * The property that matters: with the Cloudinary driver selected, a
+ * storage key must produce a Cloudinary URL and **not** a `/uploads`
+ * path. A `/uploads` URL under Cloudinary resolves to nothing — the
+ * file was never written to the local disk — so every product on the
+ * storefront would show the typographic placeholder while the images
+ * sat in Cloudinary where nothing looked for them.
+ */
+describe("the URL for the configured driver", () => {
+  const originalDriver = process.env.STORAGE_DRIVER;
+  const originalCloudName = process.env.CLOUDINARY_CLOUD_NAME;
+
+  beforeEach(() => {
+    process.env.STORAGE_DRIVER = "cloudinary";
+    process.env.CLOUDINARY_CLOUD_NAME = "test-cloud";
+  });
+
+  afterEach(() => {
+    if (originalDriver === undefined) {
+      delete process.env.STORAGE_DRIVER;
+    } else {
+      process.env.STORAGE_DRIVER = originalDriver;
+    }
+
+    if (originalCloudName === undefined) {
+      delete process.env.CLOUDINARY_CLOUD_NAME;
+    } else {
+      process.env.CLOUDINARY_CLOUD_NAME = originalCloudName;
+    }
+  });
+
+  it("derives a Cloudinary URL when the Cloudinary driver is selected", () => {
+    expect(imageUrl("products/2026/11/abc123.png")).toBe(
+      "https://res.cloudinary.com/test-cloud/image/upload/euro-glam-bd/products/2026/11/abc123",
+    );
+  });
+
+  it("does not produce an uploads path under the Cloudinary driver", () => {
+    // The whole point. A `/uploads` URL under Cloudinary resolves to
+    // nothing at all.
+    expect(imageUrl("products/2026/11/abc123.png")).not.toContain("/uploads");
+  });
+
+  it("matches the URL the Cloudinary driver itself produces", async () => {
+    /*
+     * The two must agree. A key that produced one URL in the admin
+     * console and a different URL on the storefront would be two
+     * separate cached copies of the same picture — the image optimiser
+     * caches by URL.
+     */
+    const { CloudinaryStorageDriver } = await import(
+      "@/lib/storage/cloudinary"
+    );
+
+    process.env.CLOUDINARY_API_KEY = "test-key";
+    process.env.CLOUDINARY_API_SECRET = "test-secret";
+
+    const key = "products/2026/11/abc123.png";
+    const driver = new CloudinaryStorageDriver();
+
+    expect(imageUrl(key)).toBe(driver.getUrl(key));
+  });
+
+  it("still passes an absolute URL through untouched", () => {
+    expect(imageUrl("https://cdn.example.com/x.jpg")).toBe(
+      "https://cdn.example.com/x.jpg",
+    );
+  });
+
+  it("rewrites a legacy filesystem path before deriving the URL", () => {
+    // The legacy path names a file on the *local* disk, which under
+    // the Cloudinary driver is not where the file is. The path is
+    // rewritten to its key first, and the key is then derived from
+    // whichever driver is configured.
+    expect(
+      imageUrl("C:\\Users\\someone\\public\\uploads\\products\\serum.jpg"),
+    ).toBe(
+      "https://res.cloudinary.com/test-cloud/image/upload/euro-glam-bd/products/serum",
+    );
+  });
+
+  it("falls back to the uploads path for any other driver name", () => {
+    process.env.STORAGE_DRIVER = "local";
+
+    expect(imageUrl("products/2026/11/abc123.png")).toBe(
+      `${IMAGE_URL_PREFIX}/products/2026/11/abc123.png`,
+    );
+  });
+
+  it("ignores the casing and whitespace of the driver name", () => {
+    process.env.STORAGE_DRIVER = "  Cloudinary  ";
+
+    expect(imageUrl("products/2026/11/abc123.png")).toContain(
+      "res.cloudinary.com",
     );
   });
 });
