@@ -1,6 +1,6 @@
 # Architecture Decisions — Euro Glam BD MVP
 
-All 12 foundational decisions locked and approved, and 231 numbered decisions in total. This file is the source of truth; code must conform to it.
+All 12 foundational decisions locked and approved, and 250 numbered decisions in total. This file is the source of truth; code must conform to it.
 
 | # | Area | Decision |
 |---|------|----------|
@@ -14,7 +14,7 @@ All 12 foundational decisions locked and approved, and 231 numbered decisions in
 | 8 | Media storage | `StorageAdapter` abstraction; local filesystem driver; robust server-side upload validation |
 | 9 | SMS workflow | Scheduled reminder processing via mock `SmsGateway`; persistent `SmsLog`; explicit opt-in consent; admin-triggered run-now |
 | 10 | Review moderation | Unverified purchases allowed; `isApproved=false` default; hidden publicly until admin approval |
-| 11 | Deployment | Long-running Node.js server environment (not serverless — local disk storage requires a persistent filesystem) |
+| 11 | Deployment | Long-running Node.js server environment by default. A serverless deployment (e.g. Vercel) is supported by setting `STORAGE_DRIVER="cloudinary"`, because the filesystem there is ephemeral — see "Step 28 decisions" |
 
 ## Derived engineering rules
 
@@ -4256,6 +4256,75 @@ The `/account` page carries a link as well — both in the "Your details" card a
 | The password form clears its fields after a change | `password-form.tsx` | The new password must not be left on a screen somebody walks away from |
 | The account API is not public | `src/proxy.ts` → `PUBLIC_API_PREFIXES` | The proxy rejects an anonymous call before it reaches the database |
 | The saved address pre-fills but does not lock the checkout | `checkout-form.tsx` → `savedAddress` | The customer always has the last word about where a parcel goes |
+
+## Step 28 decisions (the Cloudinary storage driver)
+
+The storage adapter interface was written for the local filesystem, with the explicit promise that the driver could be swapped without touching a call site. The Cloudinary driver is that swap.
+
+| # | Area | Decision |
+|---|------|----------|
+| 69 | The driver is selected by `STORAGE_DRIVER` | `getStorageDriver()` in `src/lib/storage/index.ts` reads the environment and returns the local or the Cloudinary driver. Every storage function defaults to it, so **no call site names a driver**. The switch is a configuration change, not a code change. |
+| 70 | The driver is imported statically | Not a dynamic `import()`. A dynamic import splits the module graph at runtime, and Next.js cannot then know the Cloudinary SDK is reachable from the server bundle — the failure surfaces as a missing import *at request time* instead of at build time. Static imports keep the build honest. |
+| 71 | An unknown driver name is a hard failure | `STORAGE_DRIVER=s3` throws rather than falling back to `local`. A deployment that believes it is writing to Cloudinary while writing to the filesystem is a failure that stays hidden until the files go missing — a typo must be loud, not silent. |
+| 72 | The key is persisted, not the URL | The driver returns `<scope>/<yyyy>/<mm>/<random>.<ext>` — the same shape the local driver produces. The public URL is derived at render time by `getUrl()`. This is the adapter's documented invariant, and it is the whole reason the swap is a config change: storing a URL would bake the driver into every database row. |
+| 73 | The folder and the public id are separate | Cloudinary's `folder` option is a prefix it **prepends**, and the resulting public id includes it. Passing a public id that already begins with the folder stores the object at `euro-glam-bd/euro-glam-bd/…`, where no later lookup finds it. |
+| 74 | The public id carries no extension | Cloudinary appends the format to the public id, so a public id ending in `.png` is stored as `….png.png`. The extension is stripped before the upload and restored afterwards, and the format lives in a separate Cloudinary field. |
+| 75 | The key is derived from what Cloudinary reports | `put()` compares the public id Cloudinary returns against the key it asked for, and refuses the upload when they differ. A mismatch means every later lookup would miss the object, so it is a failure rather than a silent misfiling. |
+| 76 | `delete()` really deletes | The Cloudinary driver calls `uploader.destroy`. An empty `delete()` would have made the cleanup job silently collect nothing while reporting success on every run. |
+| 77 | `delete()` is idempotent | An already-absent object resolves successfully, because the cleanup job calls it repeatedly for keys it has already tried to remove. |
+| 78 | `exists()` tells the truth | The old implementation returned `true` unconditionally — it always lied. It now performs a real lookup and returns `false` for an absent object. A `404` is an answer, not an error. |
+| 79 | The 404 is read from `error.error.http_code` | The Cloudinary SDK nests the HTTP status one level down. The check reads both levels, because a future SDK version may flatten it. |
+| 80 | The filename is CSPRNG-random | 16 bytes of `randomBytes`, rendered as 32 hex characters — the same 128-bit guarantee the local driver makes. The original implementation used `Math.random()` and a `Date.now()`-based public id, neither of which is safe against collision or guessing. |
+| 81 | The configuration is read at call time | Not at module load. `cloudinary.config()` at module scope captures `undefined` in a build that does not use this driver, and makes the module unimportable in a test that stubs the environment. |
+| 82 | A missing credential is a hard failure | `readConfig()` names the missing variables and refuses to write. A silent fall back to the local driver would let a production deployment believe it was writing to Cloudinary while writing to an ephemeral filesystem. |
+| 83 | The extension comes from the detected MIME type | Never from the client's filename, exactly as the local driver does it. |
+| 84 | The resource type is decided from the MIME type | Cloudinary keeps images and videos in separate namespaces, so an object uploaded as a video is not found by a lookup for an image with the same public id. The type is decided the same way in every operation. |
+| 85 | The scope is still an allow-list | The Cloudinary driver rejects anything outside `STORAGE_SCOPES`, exactly as the local one does. |
+| 86 | Malformed keys are refused before the API | A key must be four segments with none of them `.` or `..`. The local driver asserts the same shape on the filesystem; here it stops a crafted key reaching an HTTP request. |
+| 87 | The `cloudinary` package is a real dependency | It was missing from `package.json` entirely, so the module did not resolve and the build failed. A driver that cannot be imported is not a driver. |
+
+### Why the driver was not simply switched on
+
+The driver was implemented, configured, and — as it turned out — **unreachable**. `src/lib/storage/index.ts` had no `STORAGE_DRIVER` switch at all: every function defaulted to `getLocalStorageDriver()`, and the Cloudinary module was never imported by anything. Setting `STORAGE_DRIVER="cloudinary"` in `.env` changed nothing, and nothing said so.
+
+That is the failure this step exists to prevent, and it is worth naming precisely: **the configuration was correct and the behaviour was still wrong**. Nothing about `STORAGE_DRIVER="cloudinary"` is wrong as a *setting*; it was simply never read by anything.
+
+### Why the key is a key and not a URL
+
+The adapter's interface documentation states the invariant plainly: *storage keys are persisted, not URLs*. `Product.images` and `AdvisorImage.storageKey` hold keys like `advisor/2026/10/ab12….webp`, and the URL is derived at render time.
+
+The first version of the Cloudinary driver broke this: it returned `uploadResult.secure_url` as the key. That works, and it is exactly the trap. The moment a URL is persisted, the driver is baked into every row that holds one, and a future migration stops being a config change and becomes a data rewrite — the thing the interface was designed to avoid.
+
+The driver now returns a key with the local driver's exact shape, so a key means the same thing whichever driver produced it.
+
+### Why the Cloudinary details were established against the live API
+
+Three of the decisions above (73, 74, 79) are not things that can be read off a documentation page and trusted. They are the result of uploading real objects to the configured Cloudinary account and watching where they landed:
+
+- The `folder` option **prepends**, and the resulting public id **includes** the folder. Passing both stores the object at `euro-glam-bd/euro-glam-bd/…`.
+- Cloudinary **appends the format** to the public id, so a public id that already ends in `.png` becomes `….png.png` — and the public id it reports back has no extension at all, because the format is a separate field.
+- The HTTP status of a 404 is at `error.error.http_code`, one level below the top of the thrown error.
+
+Each of these was found by a failed lookup and then a look at what Cloudinary had actually stored. A guess here would have produced a driver that uploaded successfully and could never find its own files again — which is worse than a driver that refuses to work.
+
+### The guard rails
+
+| Rule | Where it lives | Why |
+|------|-----------------|-----|
+| The driver comes from the environment | `src/lib/storage/index.ts` → `getStorageDriver` | No call site names a driver, so the switch is a config change |
+| An unknown driver name throws | `index.ts` → `getStorageDriverName` | A typo must be loud, not a silent fall back to the local filesystem |
+| The key is persisted, not the URL | `cloudinary.ts` → `put` | A persisted URL would make a future migration a data rewrite |
+| The public id has no folder and no extension | `cloudinary.ts` → `keyToPublicId` | Cloudinary supplies both, and duplicating either misfiles the object |
+| The stored public id is verified | `cloudinary.ts` → `put` | A mismatch means every later lookup would miss the object |
+| The filename is CSPRNG-random | `cloudinary.ts` → `buildKey` | `Math.random()` and `Date.now()` are not safe against collision |
+| A missing credential throws | `cloudinary.ts` → `readConfig` | A silent fall back would hide an ephemeral filesystem in production |
+| `delete()` actually deletes, and is idempotent | `cloudinary.ts` → `delete` | The cleanup job calls it repeatedly; an empty method collects nothing |
+| `exists()` returns the truth | `cloudinary.ts` → `exists` | A method that always returns `true` always lies |
+| A 404 is an answer, not a failure | `cloudinary.ts` → `isNotFound` | The status is nested at `error.error.http_code` |
+| The scope is an allow-list | `cloudinary.ts` → `put` | The same rule the local driver enforces |
+| A malformed key never reaches the API | `cloudinary.ts` → `resolveKey` | Four segments, none of them `.` or `..` |
+| The image and video namespaces stay apart | `cloudinary.ts` → `resourceTypeFor` | Cloudinary stores them separately, so the type must be decided consistently |
+
 
 
 

@@ -2,10 +2,10 @@ import { ApiError } from "@/lib/api/errors";
 import {
   StorageError,
   deleteStoredObject,
+  getStorageDriver,
   type StorageAdapter,
   type StorageScope,
 } from "@/lib/storage";
-import { getLocalStorageDriver } from "@/lib/storage/local-driver";
 import {
   UploadValidationError,
   assertValidImage,
@@ -187,7 +187,8 @@ function toApiError(error: unknown): ApiError {
  *
  * @param files   - The uploaded files, already extracted from the form.
  * @param scope   - The storage scope to write under.
- * @param adapter - The storage adapter. Defaults to the local driver.
+ * @param adapter - The storage adapter. Defaults to the driver named by
+ *   `STORAGE_DRIVER`.
  * @param maxFiles - The largest batch this caller accepts.
  *
  * @throws ApiError 400 when the batch is empty or too large.
@@ -197,7 +198,7 @@ function toApiError(error: unknown): ApiError {
 export async function uploadDiscoveryImages(
   files: readonly File[],
   scope: DiscoveryImageScope,
-  adapter: StorageAdapter = getLocalStorageDriver(),
+  adapter: StorageAdapter = getStorageDriver(),
   maxFiles: number = MAX_DISCOVERY_IMAGES,
 ): Promise<DiscoveryImageUploadResult[]> {
   if (files.length === 0) {
@@ -308,7 +309,7 @@ export async function uploadDiscoveryImages(
  */
 export async function deleteDiscoveryImages(
   keys: readonly string[],
-  adapter: StorageAdapter = getLocalStorageDriver(),
+  adapter: StorageAdapter = getStorageDriver(),
 ): Promise<void> {
   await Promise.all(
     keys.map((key) =>

@@ -168,7 +168,10 @@ development only.
 | `OPENROUTER_API_KEY` | Only needed when `AI_PROVIDER=openrouter` |
 | `OPENROUTER_MODEL` | The OpenRouter model id. Must exist on OpenRouter **and must be multimodal** — a text-only model is rejected outright on a photo. Defaults to `deepseek/deepseek-v4.1-flash-1017` |
 | `OPENROUTER_TITLE` | The app name OpenRouter shows on its dashboard. Optional |
-| `STORAGE_DRIVER` | `local` — writes under `UPLOAD_ROOT` |
+| `STORAGE_DRIVER` | `local` — writes under `UPLOAD_ROOT`. Or `cloudinary` for a serverless deployment |
+| `CLOUDINARY_CLOUD_NAME` | Only needed when `STORAGE_DRIVER=cloudinary`. The cloud name from the Cloudinary console |
+| `CLOUDINARY_API_KEY` | Only needed when `STORAGE_DRIVER=cloudinary`. The API key from the same console panel |
+| `CLOUDINARY_API_SECRET` | Only needed when `STORAGE_DRIVER=cloudinary`. The API secret from the same console panel |
 | `UPLOAD_ROOT` | `./public/uploads` |
 | `MAX_IMAGE_BYTES` | 5 MB |
 | `MAX_VIDEO_BYTES` | 50 MB |
