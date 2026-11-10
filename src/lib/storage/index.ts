@@ -1,19 +1,6 @@
 import { getLocalStorageDriver } from "./local-driver";
-import type { StoredObject } from "./adapter";
-
-/**
- * The storage service.
- *
- * This is the module the rest of the application imports. It composes the
- * two halves that must always work together:
- *
- *   • the **adapter** — where the bytes go, and under what key.
- *   • the **validation** — whether the bytes are allowed at all.
- *
- * The adapter on its own does not validate: it trusts the caller. The
- * `upload*` functions here are the only supported way to write an object,
- * and they always validate first.
- */
+import type { StoredObject, StorageAdapter } from "./adapter";
+import { v2 as cloudinary } from "cloudinary";
 
 export {
   STORAGE_SCOPES,
@@ -50,116 +37,137 @@ export {
 
 import { assertValidImage, assertValidVideo } from "@/lib/upload/validate";
 
-import type { StorageAdapter as Adapter } from "./adapter";
+export function getStorageDriver(): StorageAdapter {
+  const driverType = process.env.STORAGE_DRIVER;
 
-/**
- * The input to an upload.
- */
+  if (driverType === "cloudinary") {
+    return {
+      async put(input) {
+        cloudinary.config({
+          cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+          api_key: process.env.CLOUDINARY_API_KEY,
+          api_secret: process.env.CLOUDINARY_API_SECRET,
+        });
+
+        return new Promise((resolve, reject) => {
+          const uploadStream = cloudinary.uploader.upload_stream(
+            {
+              folder: input.scope,
+              resource_type: "auto",
+            },
+            (error, result) => {
+              if (error || !result) {
+                return reject(error || new Error("Cloudinary upload failed"));
+              }
+              resolve({
+                key: result.public_id,
+                byteSize: result.bytes,
+                mimeType: result.format ? `image/${result.format}` : input.mimeType,
+                createdAt: new Date(),
+                url: result.secure_url,
+              } as unknown as StoredObject);
+            }
+          );
+          uploadStream.end(input.bytes);
+        });
+      },
+      async delete(key: string) {
+        cloudinary.config({
+          cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+          api_key: process.env.CLOUDINARY_API_KEY,
+          api_secret: process.env.CLOUDINARY_API_SECRET,
+        });
+        await cloudinary.uploader.destroy(key);
+      },
+      async exists(key: string): Promise<boolean> {
+        try {
+          cloudinary.config({
+            cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+            api_key: process.env.CLOUDINARY_API_KEY,
+            api_secret: process.env.CLOUDINARY_API_SECRET,
+          });
+          const result = await cloudinary.api.resource(key);
+          return !!result;
+        } catch {
+          return false;
+        }
+      },
+      getUrl(key: string): string {
+        cloudinary.config({
+          cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+          api_key: process.env.CLOUDINARY_API_KEY,
+          api_secret: process.env.CLOUDINARY_API_SECRET,
+        });
+        return cloudinary.url(key, { secure: true });
+      },
+    };
+  }
+
+  return getLocalStorageDriver();
+}
+
 export type UploadRequest = {
   readonly bytes: Buffer;
-  /** The client-declared MIME type. Cross-checked against the bytes. */
   readonly declaredMime: string | null | undefined;
-  /** The original filename. Used only for diagnostics. */
   readonly originalName: string;
-  /** The storage scope, e.g. `advisor`. */
   readonly scope: string;
 };
 
-/**
- * The result of a successful upload.
- */
 export type UploadResult = StoredObject & {
-  /** The public URL for the stored object. */
   readonly url: string;
 };
 
-/**
- * Uploads an image.
- *
- * Validates the bytes first — magic-byte detection, size cap, dimension
- * cap, and a cross-check against the declared type — and only then writes.
- *
- * @param adapter - The storage adapter. Defaults to the local driver.
- *
- * @throws UploadValidationError when validation fails.
- * @throws StorageError when the write fails.
- */
 export async function uploadImage(
   request: UploadRequest,
-  adapter: Adapter = getLocalStorageDriver(),
+  adapter: StorageAdapter = getStorageDriver(),
 ): Promise<UploadResult> {
-  const validated = assertValidImage(
-    request.bytes,
-    request.declaredMime,
-  );
-
+  const validated = assertValidImage(request.bytes, request.declaredMime);
   const stored = await adapter.put({
     bytes: request.bytes,
     mimeType: validated.mimeType,
     originalName: request.originalName,
     scope: request.scope,
   });
-
   return {
     ...stored,
     url: adapter.getUrl(stored.key),
   };
 }
 
-/**
- * Uploads a video.
- *
- * @throws UploadValidationError when validation fails.
- * @throws StorageError when the write fails.
- */
 export async function uploadVideo(
   request: UploadRequest,
-  adapter: Adapter = getLocalStorageDriver(),
+  adapter: StorageAdapter = getStorageDriver(),
 ): Promise<UploadResult> {
-  const validated = assertValidVideo(
-    request.bytes,
-    request.declaredMime,
-  );
-
+  const validated = assertValidVideo(request.bytes, request.declaredMime);
   const stored = await adapter.put({
     bytes: request.bytes,
     mimeType: validated.mimeType,
     originalName: request.originalName,
     scope: request.scope,
   });
-
   return {
     ...stored,
     url: adapter.getUrl(stored.key),
   };
 }
 
-/**
- * Returns the public URL for a stored key.
- */
 export function getStorageUrl(
   key: string,
-  adapter: Adapter = getLocalStorageDriver(),
+  adapter: StorageAdapter = getStorageDriver(),
 ): string {
   return adapter.getUrl(key);
 }
 
-/**
- * Deletes a stored object. Idempotent.
- */
 export async function deleteStoredObject(
   key: string,
-  adapter: Adapter = getLocalStorageDriver(),
+  adapter: StorageAdapter = getStorageDriver(),
 ): Promise<void> {
   await adapter.delete(key);
 }
 
-/**
- * Returns true when a stored object exists.
- */
 export async function storedObjectExists(
   key: string,
-  adapter: Adapter = getLocalStorageDriver(),
+  adapter: StorageAdapter = getStorageDriver(),
 ): Promise<boolean> {
   return adapter.exists(key);
 }

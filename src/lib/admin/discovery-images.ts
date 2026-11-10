@@ -2,10 +2,10 @@ import { ApiError } from "@/lib/api/errors";
 import {
   StorageError,
   deleteStoredObject,
+  getStorageDriver,
   type StorageAdapter,
   type StorageScope,
 } from "@/lib/storage";
-import { getLocalStorageDriver } from "@/lib/storage/local-driver";
 import {
   UploadValidationError,
   assertValidImage,
@@ -187,7 +187,7 @@ function toApiError(error: unknown): ApiError {
  *
  * @param files   - The uploaded files, already extracted from the form.
  * @param scope   - The storage scope to write under.
- * @param adapter - The storage adapter. Defaults to the local driver.
+ * @param adapter - The storage adapter. Defaults to the dynamic driver selector.
  * @param maxFiles - The largest batch this caller accepts.
  *
  * @throws ApiError 400 when the batch is empty or too large.
@@ -197,7 +197,7 @@ function toApiError(error: unknown): ApiError {
 export async function uploadDiscoveryImages(
   files: readonly File[],
   scope: DiscoveryImageScope,
-  adapter: StorageAdapter = getLocalStorageDriver(),
+  adapter: StorageAdapter = getStorageDriver(),
   maxFiles: number = MAX_DISCOVERY_IMAGES,
 ): Promise<DiscoveryImageUploadResult[]> {
   if (files.length === 0) {
@@ -211,17 +211,6 @@ export async function uploadDiscoveryImages(
   }
 
   // ── Validate the whole batch before writing any of it ───────────────
-  //
-  // `assertValidImage` is the same check the product and advisor uploads
-  // use: the magic bytes decide the type, the declared type is only ever a
-  // cross-check, and the size and dimension caps are enforced here.
-  //
-  // Validation is separated from the write on purpose. `uploadImage()`
-  // does both, so calling it in a loop would write the first file before
-  // the second was checked — and a batch where the fourth file is a
-  // renamed `.txt` would leave three orphaned files on disk. Reading the
-  // bytes once and validating the batch up front makes the write phase
-  // all-or-nothing.
   const prepared = await Promise.all(
     files.map(async (file) => {
       const bytes = Buffer.from(await file.arrayBuffer());
@@ -250,9 +239,6 @@ export async function uploadDiscoveryImages(
     for (const entry of prepared) {
       const stored = await adapter.put({
         bytes: entry.bytes,
-        // The **detected** type, never the client's. The extension on
-        // disk comes from this, so a renamed file gets the extension it
-        // actually is.
         mimeType: entry.mimeType,
         originalName: entry.file.name,
         scope,
@@ -269,10 +255,6 @@ export async function uploadDiscoveryImages(
       });
     }
   } catch (error) {
-    // A write failed part-way through the batch. The files already on
-    // disk are orphans — nothing references them yet — so they are
-    // removed. A cleanup failure is logged, not thrown: the original
-    // error is the one the admin needs to see.
     await Promise.all(
       written.map((key) =>
         deleteStoredObject(key, adapter).catch((cleanupError: unknown) => {
@@ -293,22 +275,11 @@ export async function uploadDiscoveryImages(
 /**
  * Deletes discovery images that are no longer referenced.
  *
- * ── Why this is best-effort ─────────────────────────────────────────────
- *
- * The row has already been updated by the time this runs — the image and
- * the row move together. If a file cannot be deleted, the row is still
- * correct: it points at the image it should. An orphaned file is a
- * disk-space problem for a maintenance job, not a correctness problem for
- * the catalogue.
- *
- * So a failure here is logged, not thrown. Swallowing it would hide a real
- * problem; throwing it would fail a request whose actual work succeeded.
- *
  * @param keys - The storage keys to remove.
  */
 export async function deleteDiscoveryImages(
   keys: readonly string[],
-  adapter: StorageAdapter = getLocalStorageDriver(),
+  adapter: StorageAdapter = getStorageDriver(),
 ): Promise<void> {
   await Promise.all(
     keys.map((key) =>
