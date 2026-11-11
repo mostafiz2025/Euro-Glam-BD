@@ -102,7 +102,14 @@ function localUrlPrefix(): string {
  * @param key - The storage key, e.g. `advisor/2026/10/9f2c….webp`.
  */
 export function imageUrl(key: string): string {
-  const trimmed = key.trim();
+  // ডাটাবেজ থেকে যদি অ্যারে বা কোটেশন আকারে স্ট্রিং আসে, সেগুলোকে ক্লিন করে নেওয়া
+  const cleanedKey = key
+    .replace(/^\[\s*["']?/, "")
+    .replace(/["']?\s*\]$/, "")
+    .replace(/^["']|["']$/g, "")
+    .trim();
+
+  const trimmed = cleanedKey;
 
   if (trimmed === "") {
     return "";
