@@ -66,10 +66,6 @@ export const IMAGE_URL_PREFIX = "/uploads";
 
 /**
  * Whether the **Cloudinary** driver is the configured one.
- *
- * The same check `getStorageDriver()` makes, so the URL this module
- * builds and the driver the upload path writes through cannot disagree
- * about which driver is in use.
  */
 function isCloudinaryDriver(): boolean {
   return (
@@ -82,10 +78,6 @@ function isCloudinaryDriver(): boolean {
 
 /**
  * The local driver's URL prefix.
- *
- * Read from the environment at **call time**, so a deployment that
- * changes `STORAGE_URL_PREFIX` is honoured without a rebuild — and so
- * the value never disagrees with the local driver's own `getUrl()`.
  */
 function localUrlPrefix(): string {
   const configured = process.env.STORAGE_URL_PREFIX;
@@ -117,9 +109,7 @@ export function imageUrl(key: string): string {
     return "";
   }
 
-  // A key that is already an absolute URL is passed through. This makes
-  // the component tolerant of a row that was written by an admin who
-  // pasted a URL into the image field.
+  // A key that is already an absolute URL is passed through.
   if (
     trimmed.startsWith("http://") ||
     trimmed.startsWith("https://") ||
@@ -128,35 +118,28 @@ export function imageUrl(key: string): string {
     return trimmed;
   }
 
-  /*
-   * A legacy row holds an **absolute filesystem path** — the path on
-   * the machine that uploaded the file, not a storage key. Joining it
-   * onto `/uploads` produced a URL that resolved to nothing, so the
-   * product showed its placeholder while the image sat on disk.
-   *
-   * The path is rewritten to the key it was pointing at. The file has
-   * not moved; only the reference is corrected.
-   */
   const withoutLeadingSlash = trimmed.replace(/^\/+/, "");
 
   const legacyKey = legacyPathToStorageKey(withoutLeadingSlash);
 
   const storageKey = legacyKey ?? withoutLeadingSlash;
 
-  /*
-   * The Cloudinary driver serves the key from its own CDN, so the URL is
-   * built from the cloud name rather than from the local prefix.
-   *
-   * When the cloud name is **not** configured the local URL is used
-   * instead. That is the honest fallback: a Cloudinary deployment with
-   * no cloud name cannot serve a Cloudinary URL, and returning an empty
-   * string would render nothing at all — whereas the local URL at least
-   * points at the path the file would occupy on the local driver.
-   */
   if (isCloudinaryDriver()) {
+    // প্রথমে ড্রাইভারে থাকা ফাংশন দিয়ে ট্রাই করবে
     const url = cloudinaryDeliveryUrl(storageKey);
-
     if (url !== null) return url;
+
+    // যদি কোনো কারণে null রিটার্ন করে, তবে সরাসরি ক্লাউডিনারি স্ট্যান্ডার্ড ইউআরএল তৈরি করে দেবে
+    // এখানে আপনার ক্লাউডিনারি ক্লাউড নেম অথবা এনভায়রনমেন্ট থেকে নাম নেবে
+    const cloudName =
+      process.env.CLOUDINARY_CLOUD_NAME ||
+      process.env.NEXT_PUBLIC_CLOUDINARY_CLOUD_NAME ||
+      "dlmhnvjj2"; // আপনার প্রজেক্টের ক্লাউডিনারি একাউন্ট বা ফলব্যাক নাম
+
+    if (cloudName) {
+      const cleanKey = storageKey.replace(/^\/+/, "");
+      return `https://res.cloudinary.com/${cloudName}/image/upload/euro-glam-bd/${cleanKey}`;
+    }
   }
 
   return `${localUrlPrefix()}/${storageKey}`;
@@ -164,48 +147,14 @@ export function imageUrl(key: string): string {
 
 /**
  * Extracts the storage key from a **legacy absolute filesystem path**.
- *
- * ── Why this exists ──────────────────────────────────────────────────────
- *
- * Before the upload pipeline, images were placed into
- * `public/uploads/products/` by hand and the **absolute path on the
- * machine that uploaded them** was written into the column:
- *
- * ```
- * C:\Users\someone\Downloads\Euro Glam BD\public\uploads\products\serum.jpg
- * ```
- *
- * That is not a storage key, and joining it onto `/uploads` produced
- * `/uploads/C:\Users\...\serum.jpg` — a URL that resolves to nothing.
- * Every one of those products showed the typographic placeholder on the
- * storefront, and the image was sitting on disk the whole time.
- *
- * So the path is rewritten to the key it was pointing at:
- * `products/serum.jpg`. The file is still exactly where it was; only
- * the reference is corrected.
- *
- * ### The three shapes it recognises
- *
- *   • A Windows path — `C:\…\public\uploads\products\serum.jpg`
- *   • A POSIX path — `/srv/app/public/uploads/products/serum.jpg`
- *   • A path that already contains the uploads root mid-string
- *
- * A path that does **not** contain the uploads root is not one of ours,
- * and it is returned unchanged rather than guessed at.
  */
 export function legacyPathToStorageKey(value: string): string | null {
   const trimmed = value.trim();
 
   if (trimmed === "") return null;
 
-  // Normalise the separators so one rule handles both platforms. The
-  // Windows drive letter keeps its colon — the regex below looks for
-  // the uploads root, not for a drive letter.
   const unified = trimmed.replace(/\\/g, "/");
 
-  // The marker that identifies "this path points into our uploads
-  // directory". Both the public/uploads form and the uploads form are
-  // accepted, because the driver root is configurable.
   const marker = unified.lastIndexOf("/uploads/");
 
   if (marker === -1) return null;
@@ -219,11 +168,6 @@ export function legacyPathToStorageKey(value: string): string | null {
 
 /**
  * Returns the first usable image URL from a product's image list.
- *
- * The list is a `String[]` on the schema, and it may be empty — the
- * seeded catalogue has no images at all. A component that assumes a
- * non-empty list crashes on the very first product in the database, so
- * every image consumer goes through here and gets `null` instead.
  */
 export function firstImageUrl(images: readonly string[]): string | null {
   for (const key of images) {
