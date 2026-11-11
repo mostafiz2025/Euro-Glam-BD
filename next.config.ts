@@ -42,15 +42,14 @@ const nextConfig: NextConfig = {
      * path, so it is served by the app itself and never goes through the
      * remote optimiser.
      */
-    remotePatterns: cloudinaryCloudName
-      ? [
-          {
-            protocol: "https",
-            hostname: "res.cloudinary.com",
-            pathname: `/${cloudinaryCloudName}/**`,
-          },
-        ]
-      : [],
+    remotePatterns: [
+      {
+        protocol: "https",
+        hostname: "res.cloudinary.com",
+        // যদি ক্লাউড নাম থাকে তবে নির্দিষ্ট পাথ, না থাকলে যেকোনো ক্লাউডিনারি পাথ অ্যালাউ করবে
+        pathname: cloudinaryCloudName ? `/${cloudinaryCloudName}/**` : "/**",
+      },
+    ],
   },
 };
 
