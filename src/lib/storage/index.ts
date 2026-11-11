@@ -1,6 +1,6 @@
+import { getCloudinaryStorageDriver } from "./cloudinary-driver";
 import { getLocalStorageDriver } from "./local-driver";
 import type { StoredObject, StorageAdapter } from "./adapter";
-import { v2 as cloudinary } from "cloudinary";
 
 export {
   STORAGE_SCOPES,
@@ -21,6 +21,11 @@ export {
 } from "./local-driver";
 
 export {
+  CloudinaryStorageDriver,
+  getCloudinaryStorageDriver,
+} from "./cloudinary-driver";
+
+export {
   ALLOWED_IMAGE_MIME_TYPES,
   ALLOWED_VIDEO_MIME_TYPES,
   MAX_IMAGE_DIMENSION,
@@ -37,70 +42,35 @@ export {
 
 import { assertValidImage, assertValidVideo } from "@/lib/upload/validate";
 
+/**
+ * Returns the storage driver the deployment is configured to use.
+ *
+ * ── Why the selection is dynamic ────────────────────────────────────────
+ *
+ * The driver is chosen from `STORAGE_DRIVER` **at call time**, not at
+ * module load. Two reasons:
+ *
+ *   1. The environment is not guaranteed to be populated when the module
+ *      is first imported, so a module-level decision would capture
+ *      `undefined`.
+ *   2. The choice is a deployment concern, not a code concern — the same
+ *      build runs on the local filesystem in development and on Cloudinary
+ *      in production.
+ *
+ * So every call re-reads the environment and returns the matching driver.
+ * Both drivers are singletons, so the repeated call is cheap.
+ *
+ * **The Cloudinary driver is the production one.** The local filesystem
+ * is ephemeral on Vercel: a file written there is gone after the next
+ * deployment, and it is not shared between the server instances. So a
+ * shop that uploads an image to the local driver in production loses it
+ * on the next deploy.
+ */
 export function getStorageDriver(): StorageAdapter {
   const driverType = process.env.STORAGE_DRIVER;
 
   if (driverType === "cloudinary") {
-    return {
-      async put(input) {
-        cloudinary.config({
-          cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
-          api_key: process.env.CLOUDINARY_API_KEY,
-          api_secret: process.env.CLOUDINARY_API_SECRET,
-        });
-
-        return new Promise((resolve, reject) => {
-          const uploadStream = cloudinary.uploader.upload_stream(
-            {
-              folder: input.scope,
-              resource_type: "auto",
-            },
-            (error, result) => {
-              if (error || !result) {
-                return reject(error || new Error("Cloudinary upload failed"));
-              }
-              resolve({
-                key: result.public_id,
-                byteSize: result.bytes,
-                mimeType: result.format ? `image/${result.format}` : input.mimeType,
-                createdAt: new Date(),
-                url: result.secure_url,
-              } as unknown as StoredObject);
-            }
-          );
-          uploadStream.end(input.bytes);
-        });
-      },
-      async delete(key: string) {
-        cloudinary.config({
-          cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
-          api_key: process.env.CLOUDINARY_API_KEY,
-          api_secret: process.env.CLOUDINARY_API_SECRET,
-        });
-        await cloudinary.uploader.destroy(key);
-      },
-      async exists(key: string): Promise<boolean> {
-        try {
-          cloudinary.config({
-            cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
-            api_key: process.env.CLOUDINARY_API_KEY,
-            api_secret: process.env.CLOUDINARY_API_SECRET,
-          });
-          const result = await cloudinary.api.resource(key);
-          return !!result;
-        } catch {
-          return false;
-        }
-      },
-      getUrl(key: string): string {
-        cloudinary.config({
-          cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
-          api_key: process.env.CLOUDINARY_API_KEY,
-          api_secret: process.env.CLOUDINARY_API_SECRET,
-        });
-        return cloudinary.url(key, { secure: true });
-      },
-    };
+    return getCloudinaryStorageDriver();
   }
 
   return getLocalStorageDriver();

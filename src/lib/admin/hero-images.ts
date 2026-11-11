@@ -1,5 +1,8 @@
-import { deleteStoredObject, type StorageAdapter } from "@/lib/storage";
-import { getLocalStorageDriver } from "@/lib/storage/local-driver";
+import {
+  deleteStoredObject,
+  getStorageDriver,
+  type StorageAdapter,
+} from "@/lib/storage";
 
 /**
  * The homepage hero's artwork.
@@ -35,11 +38,13 @@ import { getLocalStorageDriver } from "@/lib/storage/local-driver";
  * Deletes a hero banner's artwork.
  *
  * @param key    - The storage key to remove.
- * @param adapter - The storage adapter. Defaults to the local driver.
+ * @param adapter - The storage adapter. Defaults to the **configured**
+ *                  driver, so the banner's artwork is removed from
+ *                  wherever it was actually written.
  */
 export async function deleteHeroBannerImage(
   key: string,
-  adapter: StorageAdapter = getLocalStorageDriver(),
+  adapter: StorageAdapter = getStorageDriver(),
 ): Promise<void> {
   try {
     await deleteStoredObject(key, adapter);

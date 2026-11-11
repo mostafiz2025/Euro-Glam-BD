@@ -1,6 +1,9 @@
 import { ApiError } from "@/lib/api/errors";
-import { deleteStoredObject, type StorageAdapter } from "@/lib/storage";
-import { getLocalStorageDriver } from "@/lib/storage/local-driver";
+import {
+  deleteStoredObject,
+  getStorageDriver,
+  type StorageAdapter,
+} from "@/lib/storage";
 
 import {
   MAX_PRODUCT_IMAGES,
@@ -106,7 +109,9 @@ export type ProductImageUploadResult = {
  *    first two are deleted.
  *
  * @param files - The uploaded files, already extracted from the form.
- * @param adapter - The storage adapter. Defaults to the local driver.
+ * @param adapter - The storage adapter. Defaults to the **configured**
+ *                  driver, so a production deployment writing to
+ *                  Cloudinary does not have to be told about it here.
  *
  * @throws ApiError 400 when the batch is empty or too large.
  * @throws ApiError 413 when a file is too large.
@@ -114,7 +119,7 @@ export type ProductImageUploadResult = {
  */
 export async function uploadProductImages(
   files: readonly File[],
-  adapter: StorageAdapter = getLocalStorageDriver(),
+  adapter: StorageAdapter = getStorageDriver(),
 ): Promise<ProductImageUploadResult[]> {
   if (files.length === 0) {
     throw ApiError.validation("Choose at least one image to upload.");
@@ -172,7 +177,7 @@ export async function uploadProductImages(
  */
 export async function deleteProductImages(
   keys: readonly string[],
-  adapter: StorageAdapter = getLocalStorageDriver(),
+  adapter: StorageAdapter = getStorageDriver(),
 ): Promise<void> {
   await Promise.all(
     keys.map((key) =>
