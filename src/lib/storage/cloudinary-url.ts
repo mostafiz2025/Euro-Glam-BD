@@ -23,7 +23,7 @@
  * `cloudinary.url()` works, but it emits a **signed** URL:
  *
  * ```
- * https://res.cloudinary.com/<cloud>/image/upload/v1/<folder>/<id>?_a=BAMAROiw0
+ * [https://res.cloudinary.com/](https://res.cloudinary.com/)<cloud>/image/upload/v1/<folder>/<id>?_a=BAMAROiw0
  * ```
  *
  * Two things about that are wrong for this shop:
@@ -40,7 +40,7 @@
  * The bare form is used instead:
  *
  * ```
- * https://res.cloudinary.com/<cloud>/image/upload/<folder>/<key>
+ * [https://res.cloudinary.com/](https://res.cloudinary.com/)<cloud>/image/upload/<folder>/<key>
  * ```
  *
  * It resolves to the same asset, it is stable, and it is identical
@@ -64,9 +64,16 @@ export const CLOUDINARY_FOLDER = "euro-glam-bd";
  * module is first imported.
  */
 export function cloudinaryCloudName(): string | null {
-  const name = process.env.CLOUDINARY_CLOUD_NAME;
+  const name =
+    process.env.CLOUDINARY_CLOUD_NAME ||
+    process.env.NEXT_PUBLIC_CLOUDINARY_CLOUD_NAME;
 
-  return name && name.trim().length > 0 ? name.trim() : null;
+  if (name && name.trim().length > 0) {
+    return name.trim();
+  }
+
+  // ফলব্যাক হিসেবে আপনার প্রজেক্টের রিয়েল ক্লাউড নেম
+  return "dlmhnvjj2";
 }
 
 /**
