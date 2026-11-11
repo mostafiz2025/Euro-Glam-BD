@@ -74,7 +74,9 @@ export const IMAGE_URL_PREFIX = "/uploads";
 function isCloudinaryDriver(): boolean {
   return (
     process.env.STORAGE_DRIVER === "cloudinary" ||
-    Boolean(process.env.CLOUDINARY_CLOUD_NAME)
+    Boolean(process.env.CLOUDINARY_CLOUD_NAME) ||
+    Boolean(process.env.NEXT_PUBLIC_CLOUDINARY_CLOUD_NAME) ||
+    process.env.NODE_ENV === "production"
   );
 }
 
@@ -102,7 +104,7 @@ function localUrlPrefix(): string {
  * @param key - The storage key, e.g. `advisor/2026/10/9f2c….webp`.
  */
 export function imageUrl(key: string): string {
-  // ডাটাবেজ থেকে যদি অ্যারে বা কোটেশন আকারে স্ট্রিং আসে, সেগুলোকে ক্লিন করে নেওয়া
+  // ডাটাবেজ থেকে যদি অ্যারে বা কোটেশন আকারে স্ট্রিং আসে, সেগুলোকে ক্লিন করে নেওয়া
   const cleanedKey = key
     .replace(/^\[\s*["']?/, "")
     .replace(/["']?\s*\]$/, "")
