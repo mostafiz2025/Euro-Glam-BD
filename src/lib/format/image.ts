@@ -74,7 +74,6 @@ export const IMAGE_URL_PREFIX = "/uploads";
 function isCloudinaryDriver(): boolean {
   return (
     process.env.STORAGE_DRIVER === "cloudinary" ||
-    process.env.NEXT_PUBLIC_STORAGE_DRIVER === "cloudinary" ||
     Boolean(process.env.CLOUDINARY_CLOUD_NAME)
   );
 }
